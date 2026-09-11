@@ -43,11 +43,13 @@ containing the iOS work; upstream clones will not build here.
 ### 32-bit Windows applications
 
 The Actions IPA build includes a WoW64 path for 32-bit x86 Windows programs.
-It builds Wine's separate `i386-windows` PE tree and FEX's ARM64 WoW64 module,
-then ships the latter as `aarch64-windows/xtajit.dll`. The runtime reads the
-target PE header and prepares `system32` for the ARM64 host and `syswow64` for
-the i386 guest; `MADEIRA_USE_WOW64=1` can force that mode for a launcher whose
-target is created after startup.
+It follows the FEX fork's paired WoA builds: the ARM64 host uses the existing
+ARM64 Wine PE tree, while the guest side adds Wine's `i386-windows` PE tree and
+FEX's ARM64 WoW64 module. The latter is installed as
+`aarch64-windows/xtajit.dll`, beside the existing `xtajit64.dll`. The runtime
+reads the target PE header and prepares `system32` for the ARM64 host and
+`syswow64` for the i386 guest; `MADEIRA_USE_WOW64=1` can force that mode for a
+launcher whose target is created after startup.
 
 32-bit Windows code requires real allocations below 2 GB. WoW64 IPA builds
 therefore remove the Mach-O 4 GB `__PAGEZERO` reservation with

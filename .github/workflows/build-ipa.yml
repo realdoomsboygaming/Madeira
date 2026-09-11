@@ -473,18 +473,18 @@ jobs:
           # The WoW64 module is an ARM64 Windows PE DLL loaded by Wine's
           # 64-bit host. It is a separate FEX configure because the app's
           # FEXCore archive must remain an iOS Mach-O library.
-          MINGW_BIN="$PWD/toolchains/$MINGW/bin"
+          export PATH="$PWD/toolchains/$MINGW/bin:$PATH"
+          # This is the fork's cmake_configure_woa32.sh method, with the
+          # Nix-provided toolchain paths replaced by the llvm-mingw bundle
+          # already installed above. It is the 32-bit counterpart to the
+          # supplied cmake_configure_woa64.sh flow.
           cmake -S FEX -B FEX/build-wow64 -G Ninja \
-            -DCMAKE_SYSTEM_NAME=Windows \
-            -DCMAKE_SYSTEM_PROCESSOR=arm64 \
-            -DCMAKE_C_COMPILER="$MINGW_BIN/aarch64-w64-mingw32-clang" \
-            -DCMAKE_CXX_COMPILER="$MINGW_BIN/aarch64-w64-mingw32-clang++" \
-            -DCMAKE_RC_COMPILER="$MINGW_BIN/llvm-windres" \
-            -DCMAKE_AR="$MINGW_BIN/llvm-ar" \
-            -DCMAKE_RANLIB="$MINGW_BIN/llvm-ranlib" \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/FEX/Data/CMake/toolchain_mingw.cmake" \
+            -DMINGW_TRIPLE=aarch64-w64-mingw32 \
+            -DCMAKE_INSTALL_PREFIX="$PWD/FEX/build-wow64/install" \
+            -DCMAKE_INSTALL_LIBDIR=lib/wine/aarch64-windows \
             -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_MACOSX_BUNDLE=OFF \
             -DBUILD_TESTING=OFF \
             -DBUILD_TESTS=False \
             -DBUILD_THUNKS=OFF \
@@ -514,10 +514,11 @@ jobs:
             grep -n "error:" /tmp/fex-wow64.log | head -80 || true
             exit "$rc"
           fi
+          cmake --install FEX/build-wow64
       - name: Stage FEX WoW64 module
         run: |
           set -euxo pipefail
-          WOW64_FEX="$(find FEX/build-wow64 -type f \( -iname 'libwow64fex.dll' -o -iname 'wow64fex.dll' \) -print -quit)"
+          WOW64_FEX="$(find FEX/build-wow64/install -type f \( -iname 'libwow64fex.dll' -o -iname 'wow64fex.dll' \) -print -quit)"
           test -n "$WOW64_FEX"
           mkdir -p app/Madeira/aarch64-windows
           cp -f "$WOW64_FEX" app/Madeira/aarch64-windows/xtajit.dll
