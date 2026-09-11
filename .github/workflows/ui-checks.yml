@@ -85,8 +85,8 @@ jobs:
           set -euo pipefail
           APP="$RUNNER_TEMP/madeira-preview-products/LibraryPreview.app"
           mkdir -p artifacts/ui-screenshots
-          iphone="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ {print $2; exit}')"
-          ipad="$(xcrun simctl list devices available | awk -F '[()]' '/iPad/ {print $2; exit}')"
+          iphone="$(xcrun simctl list devices available | grep 'iPhone' | grep -Eo '[0-9A-F-]{36}' | head -n1)"
+          ipad="$(xcrun simctl list devices available | grep 'iPad' | grep -Eo '[0-9A-F-]{36}' | head -n1)"
           test -n "$iphone"; test -n "$ipad"
 
           capture() {
