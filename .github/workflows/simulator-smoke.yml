@@ -1,0 +1,147 @@
+name: Madeira Real App Simulator Smoke
+
+on:
+  push:
+    paths:
+      - 'app/Madeira/**'
+      - 'app/Madeira.xcodeproj/**'
+      - '.github/workflows/simulator-smoke.yml'
+  pull_request:
+    paths:
+      - 'app/Madeira/**'
+      - 'app/Madeira.xcodeproj/**'
+      - '.github/workflows/simulator-smoke.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IOS_DEPLOYMENT_TARGET: '16.4'
+  BUNDLE_ID: com.willfaust.mythicemu
+
+jobs:
+  real-app:
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          if [ -d /Applications/Xcode_16.4.app ]; then
+            sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          fi
+          xcodebuild -version
+          xcrun simctl list runtimes
+
+      - name: Build the real Madeira target for Simulator
+        id: build
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          mkdir -p artifacts/simulator-smoke
+          SIM_BUILD="$RUNNER_TEMP/madeira-real-simulator-products"
+          rm -rf "$SIM_BUILD"
+          set +e
+          xcodebuild \
+            -project app/Madeira.xcodeproj \
+            -target Madeira \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            CONFIGURATION_BUILD_DIR="$SIM_BUILD" \
+            IPHONEOS_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            build 2>&1 | tee artifacts/simulator-smoke/xcodebuild.log
+          status=${PIPESTATUS[0]}
+          printf '%s\n' "$status" > artifacts/simulator-smoke/build-exit-status.txt
+          if [ "$status" -ne 0 ]; then
+            echo "Real Madeira simulator build failed with status $status"
+          fi
+          exit "$status"
+
+      - name: Launch the real Madeira app in Simulator
+        id: launch
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          mkdir -p artifacts/simulator-smoke
+          SIM_BUILD="$RUNNER_TEMP/madeira-real-simulator-products"
+          APP="$SIM_BUILD/Madeira.app"
+          if [ ! -d "$APP" ]; then
+            echo "Madeira.app was not produced; launch was not attempted" | tee artifacts/simulator-smoke/launch.log
+            printf '%s\n' 90 > artifacts/simulator-smoke/launch-exit-status.txt
+            exit 90
+          fi
+
+          udid="$(xcrun simctl list devices available | grep 'iPhone' | grep -Eo '[0-9A-F-]{36}' | head -n1)"
+          if [ -z "$udid" ]; then
+            echo "No available iPhone simulator" | tee artifacts/simulator-smoke/launch.log
+            printf '%s\n' 91 > artifacts/simulator-smoke/launch-exit-status.txt
+            exit 91
+          fi
+          printf '%s\n' "$udid" > artifacts/simulator-smoke/device-udid.txt
+          xcrun simctl boot "$udid" 2>/dev/null || true
+          xcrun simctl bootstatus "$udid" -b 2>&1 | tee artifacts/simulator-smoke/boot.log
+          set +e
+          xcrun simctl install "$udid" "$APP" 2>&1 | tee artifacts/simulator-smoke/install.log
+          install_status=${PIPESTATUS[0]}
+          if [ "$install_status" -ne 0 ]; then
+            printf '%s\n' "$install_status" > artifacts/simulator-smoke/launch-exit-status.txt
+            exit "$install_status"
+          fi
+
+          xcrun simctl spawn "$udid" log stream --style compact --level debug \
+            --predicate 'process == "Madeira" OR eventMessage CONTAINS[c] "Madeira"' \
+            > artifacts/simulator-smoke/live-log-stream.txt 2>&1 &
+          log_pid=$!
+          xcrun simctl launch "$udid" "$BUNDLE_ID" 2>&1 | tee artifacts/simulator-smoke/launch.log
+          launch_status=${PIPESTATUS[0]}
+          sleep 12
+          kill "$log_pid" 2>/dev/null || true
+          wait "$log_pid" 2>/dev/null || true
+          printf '%s\n' "$launch_status" > artifacts/simulator-smoke/launch-exit-status.txt
+          exit "$launch_status"
+
+      - name: Collect Simulator logs and crash reports
+        if: always()
+        run: |
+          set +e
+          mkdir -p artifacts/simulator-smoke
+          udid="$(cat artifacts/simulator-smoke/device-udid.txt 2>/dev/null || true)"
+          if [ -n "$udid" ]; then
+            xcrun simctl spawn "$udid" log show --style compact --last 10m \
+              --predicate 'process == "Madeira" OR eventMessage CONTAINS[c] "Madeira"' \
+              > artifacts/simulator-smoke/simulator-log-show.txt 2>&1
+            xcrun simctl spawn "$udid" launchctl print system \
+              > artifacts/simulator-smoke/launchd-state.txt 2>&1
+            xcrun simctl io "$udid" screenshot artifacts/simulator-smoke/last-screen.png \
+              > artifacts/simulator-smoke/screenshot.log 2>&1
+            xcrun simctl shutdown "$udid" > artifacts/simulator-smoke/shutdown.log 2>&1
+          fi
+          find "$HOME/Library/Logs/DiagnosticReports" -type f \
+            \( -iname '*Madeira*' -o -iname '*mythicemu*' \) \
+            -print -exec cp {} artifacts/simulator-smoke/ \; 2>/dev/null || true
+
+      - name: Upload real app Simulator diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: madeira-real-app-simulator-smoke
+          path: artifacts/simulator-smoke
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Fail when real build or launch failed
+        if: always()
+        run: |
+          build_status="$(cat artifacts/simulator-smoke/build-exit-status.txt 2>/dev/null || echo 92)"
+          launch_status="$(cat artifacts/simulator-smoke/launch-exit-status.txt 2>/dev/null || echo 93)"
+          echo "Real simulator build status: $build_status"
+          echo "Real simulator launch status: $launch_status"
+          if [ "$build_status" -ne 0 ]; then exit "$build_status"; fi
+          if [ "$launch_status" -ne 0 ]; then exit "$launch_status"; fi
