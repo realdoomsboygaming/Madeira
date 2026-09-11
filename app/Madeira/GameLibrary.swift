@@ -244,8 +244,9 @@ final class GameLibraryStore: ObservableObject {
             let values = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
             if values.isSymbolicLink == true { throw LibraryImportError.symbolicLink }
             if file.pathExtension.lowercased() == "exe", values.isRegularFile == true {
-                guard isInside(file, root: root) else { throw LibraryImportError.pathOutsideWineDrive }
-                executables.append(String(file.path.dropFirst(root.path.count + 1)))
+                let resolvedFile = file.standardizedFileURL.resolvingSymlinksInPath()
+                guard isInside(resolvedFile, root: root) else { throw LibraryImportError.pathOutsideWineDrive }
+                executables.append(String(resolvedFile.path.dropFirst(root.path.count + 1)))
             }
         }
         guard !executables.isEmpty else { throw LibraryImportError.noExecutable }
