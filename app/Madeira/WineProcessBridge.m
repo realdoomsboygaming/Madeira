@@ -444,13 +444,12 @@ static void *wine_process_thread(void *arg) {
          * are likely 90%+ of the volume (every Nt* call writes 3-5 log lines).
          *
          * Default is now PERF: only err+all (so we still see real failures).
-         * For debugging, set MADEIRA_DEBUG_VERBOSE=1 in the environment to
-         * restore the full trace channel set. */
+         * Developer diagnostics opt into the full trace channel set. */
         {
-            const char *verbose = getenv("MADEIRA_DEBUG_VERBOSE");
+            const char *verbose = getenv("MADEIRA_DIAGNOSTICS");
             if (verbose && *verbose && *verbose != '0') {
                 setenv("WINEDEBUG", "err+all,fixme+all,warn+module,warn+file,trace+process,trace+module,trace+loaddll,trace+loadorder,trace+win,trace+user32,trace+syscall,trace+file", 1);
-                LOG("WINEDEBUG = verbose (MADEIRA_DEBUG_VERBOSE set)");
+                LOG("WINEDEBUG = verbose (developer diagnostics enabled)");
             } else {
                 /* err+all keeps real failure messages, but subtract err+virtual
                  * because our iOS virtual_ios.c uses ERR() for informational
@@ -463,7 +462,7 @@ static void *wine_process_thread(void *arg) {
                  * dispatch, which is real overhead in hot paths; re-add it only
                  * alongside MADEIRA_TF_TRACE. */
                 setenv("WINEDEBUG", "err+all,err-virtual", 1);
-                LOG("WINEDEBUG = err+all,err-virtual (perf default — set MADEIRA_DEBUG_VERBOSE=1 for full trace)");
+                LOG("WINEDEBUG = err+all,err-virtual (bounded product default)");
             }
         }
 
@@ -472,7 +471,7 @@ static void *wine_process_thread(void *arg) {
         // artifact was the prior false signal. Now chasing a real bug:
         // get_desktop_window's returned HWND fails get_user_object lookup
         // when create_window receives it as req->parent.
-        setenv("MADEIRA_WIN32U", "1", 1);
+        if (getenv("MADEIRA_DIAGNOSTICS")) setenv("MADEIRA_WIN32U", "1", 1);
 
         /* iOS-Madeira ml711: default FNA to its D3D11 backend.
          *
@@ -514,7 +513,7 @@ static void *wine_process_thread(void *arg) {
          * assembly-load lines in a single run -- most of a 100k-line log, plus
          * the I/O cost of writing them, on a title we are trying to time.
          * "warning" keeps genuine failures and drops the chatter. */
-        setenv("MONO_LOG_LEVEL", "warning", 0);
+        if (getenv("MADEIRA_DIAGNOSTICS")) setenv("MONO_LOG_LEVEL", "warning", 0);
 
         /* 2026-07-05 quiet/release mode: disables the heavyweight
          * diagnostics — the PROF sampler (thread_suspends the game thread
@@ -524,7 +523,8 @@ static void *wine_process_thread(void *arg) {
          * untouched. Worth a few %% of frame time and, more importantly,
          * HEAT — thermals are what cap ProMotion at 60. COMMENT THIS OUT
          * for diagnostic/profiling sessions. */
-        setenv("MADEIRA_QUIET", "1", 1);
+        if (getenv("MADEIRA_DIAGNOSTICS")) unsetenv("MADEIRA_QUIET");
+        else setenv("MADEIRA_QUIET", "1", 1);
 
         /* task #34 share/purge-probe experiments CONCLUDED 2026-07-14
          * (remap-sharing dead; pool not purgeable; ml76 wall = mismatched
@@ -565,30 +565,9 @@ static void *wine_process_thread(void *arg) {
          * is the pure branch-feeder) or a writer-side fix. Healer stays
          * opt-in-off. */
 
-        /* Steam game vars. One title reads SteamAppPath as its asset base path and
-         * queries it dozens of times during init, so it must be present before that
-         * title starts.
-         *
-         * KNOWN DEFECT, deliberately left in place for now: this publishes ONE title's
-         * identity to EVERY guest, with overwrite=1. A different title that links a Steam
-         * wrapper therefore sees the wrong app ID. Removing it outright was tested and is
-         * NOT the fix -- it regresses the title that needs the path, and it did not change
-         * the behaviour of the title that was mis-identified, so the mismatch is real but
-         * was not the failure being chased.
-         *
-         * The durable design belongs in the title-launch layer: publish nothing by
-         * default, take the ID from explicit title metadata or the game's own
-         * steam_appid.txt, set SteamAppPath to that game's directory, and give each child
-         * its own environment rather than mutating one process-global set shared by every
-         * pseudo-process. This path usually launches explorer.exe and cannot know which
-         * title the desktop will start later, so a conditional here cannot work. */
-        setenv("SteamAppPath", "C:\\Program Files\\Thumper", 1);
-        setenv("SteamGameId", "356400", 1);
-        setenv("SteamAppId",  "356400", 1);
-
         /* iOS-Madeira 2026-07-02: publish the TRUE JIT-pool RX->RW offset to
          * xtajit64.dll (its own FEXCore copy reads this via getenv in
-         * ProcessInit). Set HERE — beside SteamAppPath, the point where
+         * ProcessInit). Set HERE, before Wine snapshots the guest environment,
          * Wine snapshots the environment — so it forwards reliably; setting
          * it in FEXBridge.mm::jit_pool_init was too early and did not reach
          * Wine's GetEnvironmentVariableW. jit_pool_init has already run by

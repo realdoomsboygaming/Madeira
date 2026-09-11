@@ -6,6 +6,7 @@ enum MadeiraTheme {
     static let panel = Color(red: 0.075, green: 0.090, blue: 0.12)
     static let accent = Color(red: 0.73, green: 0.96, blue: 0.38)
     static let muted = Color(red: 0.58, green: 0.63, blue: 0.70)
+    static let warning = Color.orange
     static func colors(_ palette: Int) -> [Color] {
         switch palette % 4 {
         case 1: return [Color(red: 0.62, green: 0.24, blue: 0.10), Color(red: 0.17, green: 0.10, blue: 0.16)]

@@ -181,10 +181,9 @@ static bool jit_pool_init(void) {
     FEXCore::DualMap::WriteOffset = write_offset;
 
     /* NOTE: the setenv that publishes this offset to xtajit64.dll lives in
-     * WineProcessBridge.m, right next to the SteamAppPath setenv — that is
-     * the point where Wine snapshots the environment, so it forwards
-     * reliably. Setting it here (jit_pool_init) is too early/wrong-timed
-     * and did not reach Wine's GetEnvironmentVariableW. See
+     * WineProcessBridge.m before Wine snapshots the environment, so it
+     * forwards reliably. Setting it here (jit_pool_init) is too early and
+     * did not reach Wine's GetEnvironmentVariableW. See
      * fex_get_jit_write_offset(). */
 
     fex_log("JIT pool initialized: RX=%p, RW=%p, size=%zu, WriteOffset=%lld",

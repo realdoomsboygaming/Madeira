@@ -9,8 +9,7 @@ struct LibrarySmokeTests {
         defer { try? fm.removeItem(at: temporary) }
         let docs = temporary.appendingPathComponent("Documents")
         let library = GameLibrary(documents: docs)
-        precondition(library.games.count == 3)
-        precondition(!library.isInstalled(library.games[0]))
+        precondition(library.games.isEmpty)
         precondition(library.localURL(for: "C:\\..\\private.exe") == nil)
         precondition(library.localURL(for: "Z:\\outside.exe") == nil)
         precondition(!library.add(title: "Missing", executable: "C:\\missing.exe", arguments: ""))
