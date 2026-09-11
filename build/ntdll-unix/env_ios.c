@@ -2011,7 +2011,7 @@ static void init_peb( RTL_USER_PROCESS_PARAMETERS *params, void *module )
         if (!wow64_params)
         {
             ERR( "WoW64 process parameters unavailable; refusing to continue init_peb\n" );
-            return;
+            exit(1); /* The iOS exit shim unwinds this Wine process thread. */
         }
 
         wow_peb->ImageBaseAddress                = PtrToUlong( peb->ImageBaseAddress );

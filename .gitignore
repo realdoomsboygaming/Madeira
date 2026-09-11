@@ -107,6 +107,7 @@ photorec.se2
 .DS_Store
 
 # Build/deploy artifacts (regenerable; keep them out of history)
+__pycache__/
 *.ipa
 clean-prefix/
 build/x64-tests/asmconf_gen/

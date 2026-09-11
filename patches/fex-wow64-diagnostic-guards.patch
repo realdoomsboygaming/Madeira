@@ -1,0 +1,19 @@
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -1397,6 +1397,7 @@
+   }
+ #endif
+ 
++#ifdef FEX_IOS_HOST
+   /* iOS-Madeira ml304 (task #51): REPORT CallbackPtr ENTRY ON ITS OWN, not via the bogus-RIP path.
+    *
+    * ml302 proved the JITCallback prologue writes the bad State.rip, and ml303 added an LR witness --
+@@ -1447,6 +1448,7 @@
+                         IosCbEntryLog[4], IosCbEntryLog[5], IosCbEntryLog[7]);
+     }
+   }
++#endif
+ 
+   /* iOS-Madeira: refuse to compile obviously-invalid guest RIPs. After a
+    * NULL-vtable virtual call (`call [rax+8]` with rax=0), control flow

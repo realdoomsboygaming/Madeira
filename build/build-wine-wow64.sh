@@ -20,4 +20,7 @@ cd "$REPO_ROOT/wine/build-wow64"
 python3 "$REPO_ROOT/build/wine-pe-targets.py" Makefile > pe-targets.txt
 targets=()
 while IFS= read -r target; do targets+=("$target"); done < pe-targets.txt
+# Link ntdll before the full PE build: architecture-specific loader hooks must
+# resolve before spending time compiling hundreds of application-facing DLLs.
+make -j"$(sysctl -n hw.ncpu)" dlls/ntdll/i386-windows/ntdll.dll
 make -j"$(sysctl -n hw.ncpu)" "${targets[@]}"

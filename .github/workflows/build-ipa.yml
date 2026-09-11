@@ -402,7 +402,7 @@ jobs:
       # left over from the author's ARM64EC-on-Windows work. It is a pure
       # diagnostic that only fires on a misaligned CASP (which the comment
       # above it says a correct guest cannot emit), so it is stubbed out.
-      - name: Patch FEX Arm64.cpp Win32 probe
+      - name: Patch FEX platform-specific diagnostics
         run: |
           set -euxo pipefail
           python3 - <<'PY'
@@ -429,6 +429,8 @@ jobs:
           print("stubbed IosLogUnimplementedCASPAL")
           PY
           grep -n -A4 "MADEIRA_CASPAL_STUB" FEX/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
+          git -C FEX apply --check ../patches/fex-wow64-diagnostic-guards.patch
+          git -C FEX apply ../patches/fex-wow64-diagnostic-guards.patch
       - name: Configure FEX
         if: steps.fex.outputs.cache-hit != 'true'
         run: |
@@ -668,7 +670,18 @@ jobs:
           python3 build/stage-wine-pe.py wine/build-wow64 app/Madeira i386
           python3 build/stage-wine-pe.py wine/build-wow64 app/Madeira aarch64
           cp FEX/build-wow64/Bin/libwow64fex.dll app/Madeira/aarch64-windows/xtajit.dll
-          file app/Madeira/aarch64-windows/xtajit.dll
+          python3 - <<'PY'
+          import runpy
+          pe = runpy.run_path('build/stage-wine-pe.py')
+          path = 'app/Madeira/aarch64-windows/xtajit.dll'
+          if pe['read_pe_machine'](path) != 0xaa64:
+              raise SystemExit('xtajit.dll must be an ARM64 host PE, not an i386 DLL')
+          PY
+          "toolchains/$MINGW/bin/llvm-readobj" --coff-exports \
+            app/Madeira/aarch64-windows/xtajit.dll > /tmp/fex-wow64-exports.txt
+          for symbol in BTCpuProcessInit BTCpuThreadInit BTCpuSimulate; do
+            grep -q "Name: $symbol$" /tmp/fex-wow64-exports.txt
+          done
 
       - name: Verify all linked libraries
         run: |
@@ -767,6 +780,7 @@ jobs:
             app/Madeira/Madeira.jailbreak.entitlements
             /tmp/fex.log
             /tmp/fex-wow64.log
+            /tmp/fex-wow64-exports.txt
             /tmp/wine-wow64.log
             wine/build-macos/config.log
             wine/build-wow64/config.log
