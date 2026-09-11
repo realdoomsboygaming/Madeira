@@ -1,0 +1,194 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		B1000001 /* PreviewApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000001 /* PreviewApp.swift */; };
+		B1000002 /* GameLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000002 /* GameLibrary.swift */; };
+		B1000003 /* RuntimeServices.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000003 /* RuntimeServices.swift */; };
+		B1000004 /* AppShell.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000004 /* AppShell.swift */; };
+		B1000005 /* SwiftTypecheckStubs.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000005 /* SwiftTypecheckStubs.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		B2000001 /* PreviewApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewApp.swift; sourceTree = "<group>"; };
+		B2000002 /* GameLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = GameLibrary.swift; path = ../../app/Madeira/GameLibrary.swift; sourceTree = "<group>"; };
+		B2000003 /* RuntimeServices.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RuntimeServices.swift; path = ../../app/Madeira/RuntimeServices.swift; sourceTree = "<group>"; };
+		B2000004 /* AppShell.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AppShell.swift; path = ../../app/Madeira/AppShell.swift; sourceTree = "<group>"; };
+		B2000005 /* SwiftTypecheckStubs.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SwiftTypecheckStubs.swift; sourceTree = "<group>"; };
+		B2000006 /* LibraryPreview.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LibraryPreview.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B2000007 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		B3000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		B4000001 = {
+			isa = PBXGroup;
+			children = (
+				B4000002 /* Preview */,
+				B4000003 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		B4000002 /* Preview */ = {
+			isa = PBXGroup;
+			children = (
+				B2000001 /* PreviewApp.swift */,
+				B2000002 /* GameLibrary.swift */,
+				B2000003 /* RuntimeServices.swift */,
+				B2000004 /* AppShell.swift */,
+				B2000005 /* SwiftTypecheckStubs.swift */,
+				B2000007 /* Info.plist */,
+			);
+			path = .;
+			sourceTree = "<group>";
+		};
+		B4000003 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				B2000006 /* LibraryPreview.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		B5000001 /* LibraryPreview */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B7000002 /* Build configuration list for target */;
+			buildPhases = (
+				B3000002 /* Sources */,
+				B3000001 /* Frameworks */,
+				B3000003 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = LibraryPreview;
+			productName = LibraryPreview;
+			productReference = B2000006 /* LibraryPreview.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		B6000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1600;
+			};
+			buildConfigurationList = B7000001 /* Build configuration list for project */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = B4000001;
+			productRefGroup = B4000003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				B5000001 /* LibraryPreview */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		B3000003 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		B3000002 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B1000001 /* PreviewApp.swift in Sources */,
+				B1000002 /* GameLibrary.swift in Sources */,
+				B1000003 /* RuntimeServices.swift in Sources */,
+				B1000004 /* AppShell.swift in Sources */,
+				B1000005 /* SwiftTypecheckStubs.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		B8000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				INFOPLIST_FILE = Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.4;
+				PRODUCT_BUNDLE_IDENTIFIER = com.madeira.librarypreview;
+				PRODUCT_NAME = LibraryPreview;
+				SDKROOT = iphonesimulator;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		B8000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				INFOPLIST_FILE = Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.4;
+				PRODUCT_BUNDLE_IDENTIFIER = com.madeira.librarypreview;
+				PRODUCT_NAME = LibraryPreview;
+				SDKROOT = iphonesimulator;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		B7000001 /* Build configuration list for project */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B8000001 /* Debug */,
+				B8000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		B7000002 /* Build configuration list for target */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B8000001 /* Debug */,
+				B8000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = B6000001 /* Project object */;
+}

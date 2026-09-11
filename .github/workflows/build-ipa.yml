@@ -41,8 +41,8 @@ jobs:
         run: |
           set -euxo pipefail
           ls -d /Applications/Xcode*.app
-          # Prefer the newest Xcode: ContentView.swift uses glassEffect(),
-          # which needs the iOS 26 SDK. Falls back to the pinned one.
+          # Prefer the newest installed Xcode while retaining the iOS 16.4
+          # deployment target. The product uses only iOS 16-era APIs.
           NEWEST="$(ls -d /Applications/Xcode_2*.app 2>/dev/null | sort -V | tail -1 || true)"
           if [ -n "$NEWEST" ]; then
             sudo xcode-select -s "$NEWEST/Contents/Developer"
@@ -697,32 +697,6 @@ jobs:
       # and -scheme both work. -target is used here.
       # ==============================================================
 
-      # ContentView.swift calls glassEffect(.regular, in:) — iOS 26 Liquid
-      # Glass API. If the selected Xcode ships an older iOS SDK the symbol
-      # does not exist and the Swift build fails. It is purely cosmetic
-      # (a blur behind two Circles), so it is stripped when unsupported.
-      - name: Patch glassEffect for older SDKs
-        run: |
-          set -euo pipefail
-          SDKV="$(xcrun --sdk iphoneos --show-sdk-version | cut -d. -f1)"
-          echo "iphoneos SDK major: $SDKV"
-          if [ "$SDKV" -ge 26 ]; then
-            echo "SDK supports glassEffect; leaving source untouched"
-            exit 0
-          fi
-          F=app/Madeira/ContentView.swift
-          grep -n "glassEffect" "$F" || true
-          python3 - "$F" <<'PY'
-          import re, sys
-          f = sys.argv[1]
-          s = open(f).read()
-          n = s.count('.glassEffect(')
-          s2 = re.sub(r'\.glassEffect\([^()]*(?:\([^()]*\)[^()]*)*\)', '', s)
-          open(f, 'w').write(s2)
-          print('removed %d glassEffect call(s); %d remain'
-                % (n, s2.count('.glassEffect(')))
-          PY
-          grep -n "glassEffect" "$F" && { echo "FATAL: calls remain"; exit 1; } || true
       - name: Build Madeira.app
         run: |
           set -euxo pipefail

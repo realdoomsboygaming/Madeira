@@ -1,0 +1,117 @@
+name: Madeira UI and Swift checks
+
+on:
+  push:
+    paths:
+      - 'app/Madeira/**'
+      - 'app/Madeira.xcodeproj/**'
+      - 'tests/library_smoke.swift'
+      - 'tests/ui-preview/**'
+      - '.github/workflows/ui-checks.yml'
+  pull_request:
+    paths:
+      - 'app/Madeira/**'
+      - 'app/Madeira.xcodeproj/**'
+      - 'tests/library_smoke.swift'
+      - 'tests/ui-preview/**'
+      - '.github/workflows/ui-checks.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IOS_DEPLOYMENT_TARGET: '16.4'
+
+jobs:
+  swift-and-preview:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Select Xcode and verify deployment target
+        run: |
+          set -euo pipefail
+          if [ -d /Applications/Xcode_16.4.app ]; then
+            sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          fi
+          xcodebuild -version
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "Deployment target: $IOS_DEPLOYMENT_TARGET"
+          test -d "$SDK"
+
+      - name: Run library persistence and import smoke test
+        run: |
+          set -euo pipefail
+          xcrun --sdk macosx swiftc -swift-version 5 \
+            app/Madeira/GameLibrary.swift tests/library_smoke.swift \
+            -o "$RUNNER_TEMP/madeira-library-smoke"
+          "$RUNNER_TEMP/madeira-library-smoke"
+
+      - name: Typecheck production library and service shell against iOS 16.4
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos swiftc -typecheck -parse-as-library -swift-version 5 \
+            -target arm64-apple-ios${IOS_DEPLOYMENT_TARGET} \
+            -sdk "$SDK" \
+            tests/ui-preview/SwiftTypecheckStubs.swift \
+            app/Madeira/GameLibrary.swift \
+            app/Madeira/RuntimeServices.swift \
+            app/Madeira/AppShell.swift
+
+      - name: Build simulator-only library and settings preview
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/madeira-preview-derived"
+          xcodebuild \
+            -project tests/ui-preview/LibraryPreview.xcodeproj \
+            -target LibraryPreview \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -derivedDataPath "$RUNNER_TEMP/madeira-preview-derived" \
+            IPHONEOS_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            build
+          test -d "$RUNNER_TEMP/madeira-preview-derived/Build/Products/Debug-iphonesimulator/LibraryPreview.app"
+
+      - name: Capture iPhone and iPad library/settings screenshots
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/madeira-preview-derived/Build/Products/Debug-iphonesimulator/LibraryPreview.app"
+          mkdir -p artifacts/ui-screenshots
+          iphone="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ {print $2; exit}')"
+          ipad="$(xcrun simctl list devices available | awk -F '[()]' '/iPad/ {print $2; exit}')"
+          test -n "$iphone"; test -n "$ipad"
+
+          capture() {
+            local udid="$1"
+            local label="$2"
+            xcrun simctl boot "$udid" 2>/dev/null || true
+            xcrun simctl bootstatus "$udid" -b
+            xcrun simctl install "$udid" "$APP"
+            xcrun simctl launch "$udid" com.madeira.librarypreview
+            sleep 3
+            xcrun simctl io "$udid" screenshot "artifacts/ui-screenshots/${label}-library.png"
+            xcrun simctl terminate "$udid" com.madeira.librarypreview || true
+            xcrun simctl launch "$udid" com.madeira.librarypreview --settings
+            sleep 2
+            xcrun simctl io "$udid" screenshot "artifacts/ui-screenshots/${label}-settings.png"
+            xcrun simctl shutdown "$udid" || true
+          }
+
+          capture "$iphone" iphone
+          capture "$ipad" ipad
+
+      - name: Upload UI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: madeira-ui-checks
+          path: artifacts/ui-screenshots
+          if-no-files-found: warn
+          retention-days: 14
