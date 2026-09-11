@@ -24,7 +24,7 @@ env:
   MADEIRA_WOW64_LDFLAGS: "-Wl,-pagezero_size,0"
   MINGW: llvm-mingw-20260421-ucrt-macos-universal
   # bump to invalidate every cache at once
-  CACHE_V: "3"
+  CACHE_V: "4"
 
 jobs:
   build:
