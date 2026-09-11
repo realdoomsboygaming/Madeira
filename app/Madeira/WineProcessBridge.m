@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <limits.h>
 #include <string.h>
+#include <stdint.h>
 
 #include "WineProcessBridge.h"
 #include "WineServerBridge.h"
@@ -285,6 +286,67 @@ extern void wine_log_set_file(const char *path);
 static pthread_t g_wine_thread;
 static volatile int g_wine_running = 0;
 static char *g_prefix_path = NULL;
+
+/* Return the PE FileHeader.Machine without asking Wine to load the image.
+ * This is used only to choose the host resource farm before __wine_main;
+ * Wine still re-validates the image and selects its own per-process machine.
+ * Keeping this probe here removes the old "full path means x64" heuristic,
+ * which sent 32-bit games into the ARM64EC farm before WoW64 existed. */
+static unsigned short madeira_pe_machine_from_file(const char *path)
+{
+    unsigned char dos[64];
+    uint32_t pe_offset, signature;
+    uint16_t machine;
+    int fd = open(path, O_RDONLY);
+
+    if (fd < 0) return 0;
+    if (pread(fd, dos, sizeof(dos), 0) != (ssize_t)sizeof(dos) ||
+        dos[0] != 'M' || dos[1] != 'Z')
+    {
+        close(fd);
+        return 0;
+    }
+
+    memcpy(&pe_offset, dos + 0x3c, sizeof(pe_offset));
+    if (pe_offset > 0x100000 ||
+        pread(fd, &signature, sizeof(signature), pe_offset) != (ssize_t)sizeof(signature) ||
+        signature != 0x00004550 ||
+        pread(fd, &machine, sizeof(machine), pe_offset + 4) != (ssize_t)sizeof(machine))
+    {
+        close(fd);
+        return 0;
+    }
+
+    close(fd);
+    return machine;
+}
+
+static unsigned short madeira_target_pe_machine(const char *exe)
+{
+    char path[PATH_MAX];
+    const char *after_drive;
+    size_t i;
+
+    if (!g_prefix_path || !exe || !*exe) return 0;
+
+    if ((exe[0] && exe[1] == ':' && (exe[2] == '\\' || exe[2] == '/')))
+    {
+        /* The launcher currently maps C: into drive_c. Keep other drive
+         * letters unknown rather than guessing at a host path. */
+        if (exe[0] != 'C' && exe[0] != 'c') return 0;
+        after_drive = exe + 3;
+        if (snprintf(path, sizeof(path), "%s/drive_c/%s", g_prefix_path, after_drive) >= (int)sizeof(path))
+            return 0;
+    }
+    else
+    {
+        if (snprintf(path, sizeof(path), "%s/drive_c/windows/system32/%s", g_prefix_path, exe) >= (int)sizeof(path))
+            return 0;
+    }
+
+    for (i = 0; path[i]; i++) if (path[i] == '\\') path[i] = '/';
+    return madeira_pe_machine_from_file(path);
+}
 
 /***********************************************************************
  *           madeira_seed_prefix_if_needed
@@ -601,23 +663,28 @@ static void *wine_process_thread(void *arg) {
         }
 
         // Pick which exe to run (env var override, default = cube.exe).
-        // Set MADEIRA_EXE=hello-x64.exe in env to launch the ARM64EC test path.
+        // The PE header is authoritative when the target is already in the
+        // prefix. Environment overrides remain useful for launchers whose
+        // target is created later (Steam) and for diagnostics.
         const char *madeira_exe = getenv("MADEIRA_EXE");
         if (!madeira_exe || !*madeira_exe) madeira_exe = "cube.exe";
-        // Heuristic: x86_64 guest exes (cube-x64, hello-x64, real games like
-        // Thumper) need the arm64ec-windows bundle (ARM64EC hybrid system
-        // DLLs that interop with FEX-translated x86_64 code). ARM64-native
-        // tests (cube.exe) use the aarch64-windows bundle.
-        // MADEIRA_USE_ARM64EC=1 forces the arm64ec path explicitly.
-        // Otherwise: detect "x64" in the exe name (cube-x64, fib-x64, etc.)
-        // OR a Win32 full path (real game launches typically need ARM64EC).
+        unsigned short target_machine = madeira_target_pe_machine(madeira_exe);
+        const char *force_wow64 = getenv("MADEIRA_USE_WOW64");
         const char *force_ec = getenv("MADEIRA_USE_ARM64EC");
-        BOOL use_arm64ec = (force_ec && *force_ec == '1') ||
-                           (strstr(madeira_exe, "x64") != NULL) ||
-                           (strchr(madeira_exe, '\\') != NULL);
+        BOOL use_wow64 = (force_wow64 && *force_wow64 == '1') || target_machine == 0x014c;
+        BOOL full_path = (strchr(madeira_exe, '\\') != NULL) ||
+                         (madeira_exe[0] && madeira_exe[1] == ':');
+        BOOL use_arm64ec = !use_wow64 &&
+                           ((force_ec && *force_ec == '1') ||
+                            target_machine == 0x8664 ||
+                            (target_machine == 0 && strstr(madeira_exe, "x64") != NULL) ||
+                            (target_machine == 0 && full_path));
         const char *bundle_subdir = use_arm64ec ? "arm64ec-windows" : "aarch64-windows";
-        LOG("Target exe: %{public}s (bundle=%{public}s)", madeira_exe, bundle_subdir);
-        dprintf(STDERR_FILENO, "[WineProc] Target exe: %s (bundle=%s)\n", madeira_exe, bundle_subdir);
+        const char *target_mode = use_wow64 ? "wow64-i386" : (use_arm64ec ? "arm64ec-x64" : "aarch64");
+        LOG("Target exe: %{public}s (machine=0x%x mode=%{public}s bundle=%{public}s)",
+            madeira_exe, target_machine, target_mode, bundle_subdir);
+        dprintf(STDERR_FILENO, "[WineProc] Target exe: %s (machine=0x%x mode=%s bundle=%s)\n",
+                madeira_exe, target_machine, target_mode, bundle_subdir);
 
         // Ensure Wine prefix has system32 directory with DLLs from bundle
         {
@@ -680,13 +747,16 @@ static void *wine_process_thread(void *arg) {
             // system32 name resolves to the session arch's binary — colliding
             // names (ucrtbase, kernel32, ...) always do. sysaa64 is the
             // mirror for the future inverse case (aarch64 child in an EC
-            // session, e.g. rpcss under Steam).
+            // session, e.g. rpcss under Steam). syswow64 is the real Wine
+            // directory used by an i386 child and must contain the 32-bit PE
+            // tree rather than another host-architecture mirror.
             {
                 struct { const char *farm; const char *arch; } farms[] = {
                     { "sysx64",  "arm64ec-windows" },
                     { "sysaa64", "aarch64-windows" },
+                    { "syswow64", "i386-windows" },
                 };
-                for (int i = 0; i < 2; i++) {
+                for (int i = 0; i < 3; i++) {
                     NSString *farmDir = [prefix stringByAppendingPathComponent:
                         [NSString stringWithFormat:@"drive_c/windows/%s", farms[i].farm]];
                     NSString *archSource = [bundlePath stringByAppendingPathComponent:

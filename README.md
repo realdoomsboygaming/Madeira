@@ -40,6 +40,22 @@ git clone --recurse-submodules <this repo>
 Note that `FEX`, `wine` and `research/dxmt` are submodules pointing at forks
 containing the iOS work; upstream clones will not build here.
 
+### 32-bit Windows applications
+
+The Actions IPA build includes a WoW64 path for 32-bit x86 Windows programs.
+It builds Wine's separate `i386-windows` PE tree and FEX's ARM64 WoW64 module,
+then ships the latter as `aarch64-windows/xtajit.dll`. The runtime reads the
+target PE header and prepares `system32` for the ARM64 host and `syswow64` for
+the i386 guest; `MADEIRA_USE_WOW64=1` can force that mode for a launcher whose
+target is created after startup.
+
+32-bit Windows code requires real allocations below 2 GB. WoW64 IPA builds
+therefore remove the Mach-O 4 GB `__PAGEZERO` reservation with
+`-Wl,-pagezero_size,0`; an older IPA built without the WoW64 stage can still
+abort in `build_wow64_parameters` before the emulator is loaded. This path is
+newly wired here and still needs validation against the specific 32-bit title
+and jailbroken device image being tested.
+
 ### Jailbroken builds
 
 The public `com.apple.developer.kernel.increased-memory-limit` entitlement is

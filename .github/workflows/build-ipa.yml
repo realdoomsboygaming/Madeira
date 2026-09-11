@@ -19,9 +19,12 @@ env:
   DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
   IOS_DEPLOYMENT_TARGET: "16.4"
   MADEIRA_ENTITLEMENTS_FILE: ${{ inputs.jailbreak_build && 'Madeira/Madeira.jailbreak.entitlements' || 'Madeira/Madeira.entitlements' }}
+  # 32-bit x86 WoW64 needs usable VA below 2 GB; the default iOS Mach-O
+  # __PAGEZERO reservation would make Wine's required allocations impossible.
+  MADEIRA_WOW64_LDFLAGS: "-Wl,-pagezero_size,0"
   MINGW: llvm-mingw-20260421-ucrt-macos-universal
   # bump to invalidate every cache at once
-  CACHE_V: "1"
+  CACHE_V: "2"
 
 jobs:
   build:
@@ -196,7 +199,9 @@ jobs:
         id: winecache
         uses: actions/cache@v4
         with:
-          path: wine/build-macos
+          path: |
+            wine/build-macos
+            wine/build-i386
           key: wine-7817e22-${{ env.CACHE_V }}
 
       # NOTE: a plain `make` CANNOT succeed here. dlls/win32u/win32u.so is
@@ -217,6 +222,16 @@ jobs:
           test -f include/config.h
           make -k -j"$(sysctl -n hw.ncpu)" 2>&1 | tail -40 || true
           echo "=== host-side link failures are expected; PE side is what matters ==="
+          cd ..
+          mkdir -p build-i386 && cd build-i386
+          ../configure \
+            --with-wine64=../build-macos \
+            --with-wine-tools=../build-macos \
+            --enable-archs=i386 \
+            --disable-tests --without-x --without-freetype
+          test -f include/config.h
+          make -k -j"$(sysctl -n hw.ncpu)" 2>&1 | tail -40 || true
+          echo "=== 32-bit i386 PE build complete; host-side failures remain non-fatal ==="
       - name: Verify Wine outputs + wire up build-arm64ec
         run: |
           set -euo pipefail
@@ -242,6 +257,13 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           ln -sfn build-macos wine/build-arm64ec
           echo "build-arm64ec -> $(readlink wine/build-arm64ec)"
+          rm -rf app/Madeira/i386-windows
+          mkdir -p app/Madeira/i386-windows
+          find wine/build-i386 -type f -path '*/i386-windows/*' -exec cp -f {} app/Madeira/i386-windows/ \;
+          test -f app/Madeira/i386-windows/ntdll.dll
+          test -f app/Madeira/i386-windows/kernel32.dll
+          echo "=== staged i386 PE modules ==="
+          find app/Madeira/i386-windows -maxdepth 1 -type f | wc -l
       # ==============================================================
       # NATIVE LIBS — GnuTLS must precede ntdll-unix: bcrypt, secur32
       # and crypt32 include $REPO_ROOT/toolchains/gnutls-ios/include.
@@ -374,7 +396,9 @@ jobs:
         id: fex
         uses: actions/cache@v4
         with:
-          path: FEX/build-ios
+          path: |
+            FEX/build-ios
+            FEX/build-wow64
           key: fex-053c385-caspalstub-${{ env.CACHE_V }}
 
       # FEX fork bug: IosLogUnimplementedCASPAL (Arm64.cpp) sits OUTSIDE
@@ -434,6 +458,31 @@ jobs:
             -DENABLE_LTO=False \
             -DTUNE_CPU=none \
             -DTUNE_ARCH=generic
+          # The WoW64 module is an ARM64 Windows PE DLL loaded by Wine's
+          # 64-bit host. It is a separate FEX configure because the app's
+          # FEXCore archive must remain an iOS Mach-O library.
+          MINGW_BIN="$PWD/toolchains/$MINGW/bin"
+          cmake -S FEX -B FEX/build-wow64 -G Ninja \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_SYSTEM_PROCESSOR=arm64 \
+            -DCMAKE_C_COMPILER="$MINGW_BIN/aarch64-w64-mingw32-clang" \
+            -DCMAKE_CXX_COMPILER="$MINGW_BIN/aarch64-w64-mingw32-clang++" \
+            -DCMAKE_RC_COMPILER="$MINGW_BIN/llvm-windres" \
+            -DCMAKE_AR="$MINGW_BIN/llvm-ar" \
+            -DCMAKE_RANLIB="$MINGW_BIN/llvm-ranlib" \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_MACOSX_BUNDLE=OFF \
+            -DBUILD_TESTING=OFF \
+            -DBUILD_TESTS=False \
+            -DBUILD_THUNKS=OFF \
+            -DENABLE_VIXL_DISASSEMBLER=OFF \
+            -DENABLE_VIXL_SIMULATOR=OFF \
+            -DENABLE_CCACHE=OFF \
+            -DENABLE_LTO=False \
+            -DENABLE_JEMALLOC_GLIBC_ALLOC=OFF \
+            -DTUNE_CPU=none \
+            -DTUNE_ARCH=generic
       - name: Build FEX
         if: steps.fex.outputs.cache-hit != 'true'
         run: |
@@ -442,8 +491,25 @@ jobs:
             --target FEXCore FEXCore_Base JemallocLibs \
             --parallel "$(sysctl -n hw.ncpu)" 2>&1 | tee /tmp/fex.log
           rc=${PIPESTATUS[0]}
-          [ "$rc" -ne 0 ] && grep -n "error:" /tmp/fex.log | head -40
-          exit "$rc"
+          if [ "$rc" -ne 0 ]; then
+            grep -n "error:" /tmp/fex.log | head -40 || true
+            exit "$rc"
+          fi
+          cmake --build FEX/build-wow64 --target wow64fex \
+            --parallel "$(sysctl -n hw.ncpu)" 2>&1 | tee /tmp/fex-wow64.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            grep -n "error:" /tmp/fex-wow64.log | head -80 || true
+            exit "$rc"
+          fi
+      - name: Stage FEX WoW64 module
+        run: |
+          set -euxo pipefail
+          WOW64_FEX="$(find FEX/build-wow64 -type f \( -iname 'libwow64fex.dll' -o -iname 'wow64fex.dll' \) -print -quit)"
+          test -n "$WOW64_FEX"
+          mkdir -p app/Madeira/aarch64-windows
+          cp -f "$WOW64_FEX" app/Madeira/aarch64-windows/xtajit.dll
+          file app/Madeira/aarch64-windows/xtajit.dll
       - name: Verify FEX libraries
         run: |
           set -euxo pipefail
@@ -648,11 +714,24 @@ jobs:
             CONFIGURATION_BUILD_DIR="$PWD/out" \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
             MADEIRA_ENTITLEMENTS_FILE="$MADEIRA_ENTITLEMENTS_FILE" \
+            OTHER_LDFLAGS="$MADEIRA_WOW64_LDFLAGS" \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             build
       - name: Check iOS 16 PMR compatibility
         run: |
           set -euo pipefail
+          test -f out/Madeira.app/aarch64-windows/xtajit.dll
+          test -f out/Madeira.app/i386-windows/ntdll.dll
+          test -f out/Madeira.app/i386-windows/kernel32.dll
+          PAGEZERO_SIZE="$(xcrun otool -l out/Madeira.app/Madeira | awk '
+            /segname __PAGEZERO/ { found=1; next }
+            found && /vmsize/ { print $2; exit }
+          ')"
+          test "$PAGEZERO_SIZE" = "0x0" || {
+            echo "ERROR: WoW64 build retained a non-zero __PAGEZERO: $PAGEZERO_SIZE"
+            exit 1
+          }
+          echo "WoW64 runtime resources staged; __PAGEZERO vmsize is zero"
           xcrun nm -u out/Madeira.app/Madeira > "$RUNNER_TEMP/madeira-imports.txt"
           if grep 'St3__13pmr' "$RUNNER_TEMP/madeira-imports.txt"; then
             echo "ERROR: Madeira imports PMR symbols that require iOS 17"
@@ -678,7 +757,9 @@ jobs:
             artifacts/Madeira.ipa
             app/Madeira/Madeira.jailbreak.entitlements
             /tmp/fex.log
+            /tmp/fex-wow64.log
             wine/build-macos/config.log
+            wine/build-i386/config.log
             research/dxmt/build-pe/meson-logs/**
             build/ntdll-unix/obj/*.err
             build/win32u-unix/obj/*.err

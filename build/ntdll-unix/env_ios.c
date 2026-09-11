@@ -1914,7 +1914,15 @@ static void *build_wow64_parameters( const RTL_USER_PROCESS_PARAMETERS *params )
 
     status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&wow64_params, limit_2g - 1, &size,
                                       MEM_COMMIT, PAGE_READWRITE );
-    assert( !status );
+    if (status)
+    {
+        /* A 32-bit process must receive a real below-2GB parameter block.
+         * Do not hide a page-zero/VA-layout failure behind SIGABRT: the
+         * caller logs the status and lets Wine report the failed startup. */
+        ERR( "failed to allocate WoW64 process parameters below 2GB: %x size=%Ix\n",
+             status, size );
+        return NULL;
+    }
 
     wow64_params->AllocationSize  = size;
     wow64_params->Size            = size;
@@ -1999,6 +2007,12 @@ static void init_peb( RTL_USER_PROCESS_PARAMETERS *params, void *module )
     if (wow_peb)
     {
         void *wow64_params = build_wow64_parameters( params );
+
+        if (!wow64_params)
+        {
+            ERR( "WoW64 process parameters unavailable; refusing to continue init_peb\n" );
+            return;
+        }
 
         wow_peb->ImageBaseAddress                = PtrToUlong( peb->ImageBaseAddress );
         wow_peb->ProcessParameters               = PtrToUlong( wow64_params );

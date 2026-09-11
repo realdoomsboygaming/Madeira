@@ -898,14 +898,11 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
      * GL probe as "no GL" and carries on — the same tolerance it shows for a
      * failed error-reporter spawn. Refusing the spawn is strictly better than
      * letting it fault. */
-    /* ml410: vulkandriverquery joins for a THIRD reason. Steam ships it as a
-     * 32-BIT x86 exe (vulkandriverquery64 is the 64-bit sibling); a 32-bit
-     * child needs build_wow64_parameters, whose NtAllocateVirtualMemory below
-     * 2GB can never succeed on iOS (4GB page zero) — assert-abort in the
-     * child's init thread, then garbage execution near the TEB band (the
-     * deterministic 0x73ffd65f40 crash of ml407/ml410). No 32-bit child can
-     * ever work under this port; there is no Vulkan driver here anyway, and
-     * Steam tolerates the refusal exactly like gldriverquery. */
+    /* ml410: vulkandriverquery used to join this gate only because the port
+     * had no WoW64 path. That is no longer a valid reason to refuse every
+     * 32-bit process: the i386 PE tree plus FEX's xtajit.dll now provide the
+     * emulation path. The helper may still fail its Vulkan probe normally;
+     * do not turn that optional helper into a global 32-bit ban. */
     /* ml497: steamsysinfo.exe joins the gate. It faulted (c0000005 inside
      * steamsysinfo.exe+0xcb78c → crashhandler64) and, because every Windows
      * "process" here is a pseudo-process inside ONE Mach process, that fault
@@ -946,7 +943,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
          * "EnterEC wrote it" does NOT name the origin — Core.cpp says so explicitly:
          * EnterEC storing an x64 target in State.rip is its job. The upstream producer
          * still needs finding via x9 at DispatchJump/RetToEntryThunk/ExitToX64. */
-        static const char * const blocked_names[] = { "steamerrorreporter", "gldriverquery", "vulkandriverquery",
+        static const char * const blocked_names[] = { "steamerrorreporter", "gldriverquery",
                                                       "steamsysinfo", "hardwareupdater",
                                                       "unitycrashhandler64" };
         const WCHAR *ip = params->ImagePathName.Buffer;
