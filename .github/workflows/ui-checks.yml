@@ -67,22 +67,23 @@ jobs:
       - name: Build simulator-only library and settings preview
         run: |
           set -euo pipefail
-          rm -rf "$RUNNER_TEMP/madeira-preview-derived"
+          PREVIEW_BUILD="$RUNNER_TEMP/madeira-preview-products"
+          rm -rf "$PREVIEW_BUILD"
           xcodebuild \
             -project tests/ui-preview/LibraryPreview.xcodeproj \
             -target LibraryPreview \
             -configuration Debug \
             -sdk iphonesimulator \
-            -derivedDataPath "$RUNNER_TEMP/madeira-preview-derived" \
+            CONFIGURATION_BUILD_DIR="$PREVIEW_BUILD" \
             IPHONEOS_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             build
-          test -d "$RUNNER_TEMP/madeira-preview-derived/Build/Products/Debug-iphonesimulator/LibraryPreview.app"
+          test -d "$PREVIEW_BUILD/LibraryPreview.app"
 
       - name: Capture iPhone and iPad library/settings screenshots
         run: |
           set -euo pipefail
-          APP="$RUNNER_TEMP/madeira-preview-derived/Build/Products/Debug-iphonesimulator/LibraryPreview.app"
+          APP="$RUNNER_TEMP/madeira-preview-products/LibraryPreview.app"
           mkdir -p artifacts/ui-screenshots
           iphone="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ {print $2; exit}')"
           ipad="$(xcrun simctl list devices available | awk -F '[()]' '/iPad/ {print $2; exit}')"
