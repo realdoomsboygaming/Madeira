@@ -42,11 +42,14 @@ containing the iOS work; upstream clones will not build here.
 
 ### 32-bit Windows applications
 
-The Actions IPA build includes a WoW64 path for 32-bit x86 Windows programs.
+The Actions IPA workflow builds an experimental WoW64 runtime for 32-bit x86
+Windows programs. A successful build does not establish on-device compatibility.
 It follows the FEX fork's paired WoA builds: the ARM64 host uses the existing
 ARM64 Wine PE tree, while the guest side adds Wine's `i386-windows` PE tree and
 FEX's ARM64 WoW64 module. The latter is installed as
-`aarch64-windows/xtajit.dll`, beside the existing `xtajit64.dll`. The runtime
+`aarch64-windows/xtajit.dll`; the existing 64-bit translator remains at
+`arm64ec-windows/xtajit64.dll`. Wine's ARM64 `wow64.dll` and `wow64win.dll`
+are built alongside the i386 guest modules. The runtime
 reads the target PE header and prepares `system32` for the ARM64 host and
 `syswow64` for the i386 guest; `MADEIRA_USE_WOW64=1` can force that mode for a
 launcher whose target is created after startup.
@@ -56,7 +59,15 @@ therefore remove the Mach-O 4 GB `__PAGEZERO` reservation with
 `-Wl,-pagezero_size,0`; an older IPA built without the WoW64 stage can still
 abort in `build_wow64_parameters` before the emulator is loaded. This path is
 newly wired here and still needs validation against the specific 32-bit title
-and jailbroken device image being tested.
+and jailbroken device image being tested, including the FEX iOS JIT and thread
+integration used by the existing 64-bit translator.
+
+The Wine build uses the pinned fork's `--enable-archs=aarch64,i386` support and
+the already-built host tools. It selects Windows runtime targets from Wine's
+generated Makefile and stops on compilation errors. Packaging checks PE machine
+types, retains EXE/DRV/CPL files as well as DLLs, and runs after the DXMT cache
+restore. Wine and FEX WoW64 builds have separate caches from the native iOS
+components. Complete compiler logs are attached to failed Actions runs.
 
 ### Jailbroken builds
 

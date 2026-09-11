@@ -24,7 +24,7 @@ env:
   MADEIRA_WOW64_LDFLAGS: "-Wl,-pagezero_size,0"
   MINGW: llvm-mingw-20260421-ucrt-macos-universal
   # bump to invalidate every cache at once
-  CACHE_V: "4"
+  CACHE_V: "1"
 
 jobs:
   build:
@@ -199,9 +199,7 @@ jobs:
         id: winecache
         uses: actions/cache@v4
         with:
-          path: |
-            wine/build-macos
-            wine/build-i386
+          path: wine/build-macos
           key: wine-7817e22-${{ env.CACHE_V }}
 
       # NOTE: a plain `make` CANNOT succeed here. dlls/win32u/win32u.so is
@@ -222,28 +220,6 @@ jobs:
           test -f include/config.h
           make -k -j"$(sysctl -n hw.ncpu)" 2>&1 | tail -40 || true
           echo "=== host-side link failures are expected; PE side is what matters ==="
-          cd ..
-          mkdir -p build-i386 && cd build-i386
-          ../configure \
-            --with-wine64=../build-macos \
-            --with-wine-tools=../build-macos \
-            --enable-archs=i386 \
-            --disable-tests --without-x --without-freetype
-          test -f include/config.h
-          make -k -j"$(sysctl -n hw.ncpu)" 2>&1 | tee /tmp/wine-i386.log | tail -40 || true
-          echo "=== i386 PE build diagnostics ==="
-          grep -nE 'error:|undefined reference|cannot find|not found' /tmp/wine-i386.log | tail -80 || true
-          # The default aggregate target can stop after unrelated host-side
-          # failures. Build the loader-critical PE images as explicit targets
-          # so a partial make cannot silently leave WoW64 without ntdll or
-          # kernel32.
-          for target in \
-            dlls/ntdll/i386-windows/ntdll.dll \
-            dlls/kernelbase/i386-windows/kernelbase.dll \
-            dlls/kernel32/i386-windows/kernel32.dll; do
-            make -k -j"$(sysctl -n hw.ncpu)" "$target" 2>&1 | tee "/tmp/wine-i386-$(basename "$target").log" | tail -40 || true
-          done
-          echo "=== 32-bit i386 PE build complete; host-side failures remain non-fatal ==="
       - name: Verify Wine outputs + wire up build-arm64ec
         run: |
           set -euo pipefail
@@ -269,13 +245,22 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           ln -sfn build-macos wine/build-arm64ec
           echo "build-arm64ec -> $(readlink wine/build-arm64ec)"
-          rm -rf app/Madeira/i386-windows
-          mkdir -p app/Madeira/i386-windows
-          find wine/build-i386 -type f -iname '*.dll' -exec cp -f {} app/Madeira/i386-windows/ \;
-          test -f app/Madeira/i386-windows/ntdll.dll
-          test -f app/Madeira/i386-windows/kernel32.dll
-          echo "=== staged i386 PE modules ==="
-          find app/Madeira/i386-windows -maxdepth 1 -type f | wc -l
+      - name: Cache Wine WoW64 build
+        id: winewow64
+        uses: actions/cache@v4
+        with:
+          path: wine/build-wow64
+          key: wine-wow64-7817e22-multiarch-1
+
+      - name: Build Wine i386 guest and ARM64 WoW64 loaders
+        if: steps.winewow64.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          bash build/build-wine-wow64.sh 2>&1 | tee /tmp/wine-wow64.log
+
+      - name: Test WoW64 build helpers
+        run: |
+          python3 -m unittest discover -s tests -p 'test_*wine_pe*.py'
       # ==============================================================
       # NATIVE LIBS — GnuTLS must precede ntdll-unix: bcrypt, secur32
       # and crypt32 include $REPO_ROOT/toolchains/gnutls-ios/include.
@@ -317,7 +302,7 @@ jobs:
             build/win32u-unix/obj
             app/Madeira/libntdll_unix.a
             app/Madeira/libwin32u_unix.a
-          key: wineunix-7817e22-${{ env.CACHE_V }}
+          key: wineunix-7817e22-wow64-1
 
       - name: Wine unix libs (ntdll, win32u)
         if: steps.wineunix.outputs.cache-hit != 'true'
@@ -408,9 +393,7 @@ jobs:
         id: fex
         uses: actions/cache@v4
         with:
-          path: |
-            FEX/build-ios
-            FEX/build-wow64
+          path: FEX/build-ios
           key: fex-053c385-caspalstub-${{ env.CACHE_V }}
 
       # FEX fork bug: IosLogUnimplementedCASPAL (Arm64.cpp) sits OUTSIDE
@@ -470,6 +453,17 @@ jobs:
             -DENABLE_LTO=False \
             -DTUNE_CPU=none \
             -DTUNE_ARCH=generic
+      - name: Cache FEX WoW64 build
+        id: fexwow64
+        uses: actions/cache@v4
+        with:
+          path: FEX/build-wow64
+          key: fex-wow64-053c385-mingw-1
+
+      - name: Configure FEX WoW64
+        if: steps.fexwow64.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
           # The WoW64 module is an ARM64 Windows PE DLL loaded by Wine's
           # 64-bit host. It is a separate FEX configure because the app's
           # FEXCore archive must remain an iOS Mach-O library.
@@ -507,22 +501,13 @@ jobs:
             grep -n "error:" /tmp/fex.log | head -40 || true
             exit "$rc"
           fi
+      - name: Build FEX WoW64
+        if: steps.fexwow64.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/toolchains/$MINGW/bin:$PATH"
           cmake --build FEX/build-wow64 --target wow64fex \
             --parallel "$(sysctl -n hw.ncpu)" 2>&1 | tee /tmp/fex-wow64.log
-          rc=${PIPESTATUS[0]}
-          if [ "$rc" -ne 0 ]; then
-            grep -n "error:" /tmp/fex-wow64.log | head -80 || true
-            exit "$rc"
-          fi
-          cmake --install FEX/build-wow64
-      - name: Stage FEX WoW64 module
-        run: |
-          set -euxo pipefail
-          WOW64_FEX="$(find FEX/build-wow64/install -type f \( -iname 'libwow64fex.dll' -o -iname 'wow64fex.dll' \) -print -quit)"
-          test -n "$WOW64_FEX"
-          mkdir -p app/Madeira/aarch64-windows
-          cp -f "$WOW64_FEX" app/Madeira/aarch64-windows/xtajit.dll
-          file app/Madeira/aarch64-windows/xtajit.dll
       - name: Verify FEX libraries
         run: |
           set -euxo pipefail
@@ -675,6 +660,16 @@ jobs:
           xcrun -sdk iphoneos libtool -static -o libdxmt_combined.a \
             obj/*.o ../../toolchains/llvm-ios-build/lib/*.a
           cp libdxmt_combined.a ../../app/Madeira/
+      # DXMT's existing cache includes aarch64-windows. Stage the newly built
+      # runtime after it is restored so the cache cannot replace these modules.
+      - name: Stage WoW64 runtime
+        run: |
+          set -euxo pipefail
+          python3 build/stage-wine-pe.py wine/build-wow64 app/Madeira i386
+          python3 build/stage-wine-pe.py wine/build-wow64 app/Madeira aarch64
+          cp FEX/build-wow64/Bin/libwow64fex.dll app/Madeira/aarch64-windows/xtajit.dll
+          file app/Madeira/aarch64-windows/xtajit.dll
+
       - name: Verify all linked libraries
         run: |
           set -euxo pipefail
@@ -740,10 +735,11 @@ jobs:
             /segname __PAGEZERO/ { found=1; next }
             found && /vmsize/ { print $2; exit }
           ')"
-          test "$PAGEZERO_SIZE" = "0x0" || {
+          # ld can omit a zero-size segment; otool may also zero-pad the value.
+          if [ -n "$PAGEZERO_SIZE" ] && [ "$((PAGEZERO_SIZE))" -ne 0 ]; then
             echo "ERROR: WoW64 build retained a non-zero __PAGEZERO: $PAGEZERO_SIZE"
             exit 1
-          }
+          fi
           echo "WoW64 runtime resources staged; __PAGEZERO vmsize is zero"
           xcrun nm -u out/Madeira.app/Madeira > "$RUNNER_TEMP/madeira-imports.txt"
           if grep 'St3__13pmr' "$RUNNER_TEMP/madeira-imports.txt"; then
@@ -771,9 +767,10 @@ jobs:
             app/Madeira/Madeira.jailbreak.entitlements
             /tmp/fex.log
             /tmp/fex-wow64.log
-            /tmp/wine-i386*.log
+            /tmp/wine-wow64.log
             wine/build-macos/config.log
-            wine/build-i386/config.log
+            wine/build-wow64/config.log
+            wine/build-wow64/pe-targets.txt
             research/dxmt/build-pe/meson-logs/**
             build/ntdll-unix/obj/*.err
             build/win32u-unix/obj/*.err
