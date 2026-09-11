@@ -1,0 +1,24 @@
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -4122,7 +4122,9 @@
+  */
+ static void iat_life_sweep( const char *when )
+ {
++#ifdef __arm64ec__
+     extern void *xlate_ios_jit( void *ptr );
++#endif
+     static struct { const void *base; ULONG rva; } seen[64];
+     static int nseen, sweeps, reports;
+     LIST_ENTRY *list, *entry;
+@@ -4170,6 +4172,10 @@
+                  * and checking only the PE side (as the first cut of this probe did)
+                  * cannot see a stale pool slot at all. */
++#ifdef __arm64ec__
+                 pslot = xlate_ios_jit( slot );
++#else
++                pslot = slot; /* x86 guest code has no ARM64EC native-code alias. */
++#endif
+                 if (pslot && pslot != slot) { has_pool = 1; n_pool++; pool_val = *(ULONG_PTR *)pslot; }
+ 
+                 if (pe_val && !(has_pool && !pool_val)) continue;   /* both views fine */

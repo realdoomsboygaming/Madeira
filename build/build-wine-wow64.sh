@@ -3,6 +3,11 @@
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$REPO_ROOT/toolchains/$MINGW/bin:$PATH"
+PATCH="$REPO_ROOT/patches/wine-wow64-loader-arch.patch"
+if ! git -C "$REPO_ROOT/wine" apply --reverse --check "$PATCH" 2>/dev/null; then
+  git -C "$REPO_ROOT/wine" apply --check "$PATCH"
+  git -C "$REPO_ROOT/wine" apply "$PATCH"
+fi
 mkdir -p "$REPO_ROOT/wine/build-wow64"
 cd "$REPO_ROOT/wine/build-wow64"
 ../configure --enable-win64 --enable-archs=aarch64,i386 \
