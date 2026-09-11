@@ -147,8 +147,11 @@ int wineserver_start(const char *prefix_path) {
      * save overwrites the template's (ml587: 17,479 keys -> 24). Seeding is
      * idempotent, so this costs one stat() on every launch after the first. */
     {
-        extern void madeira_seed_prefix_if_needed(const char *prefix_path);
-        madeira_seed_prefix_if_needed(prefix_path);
+        extern int madeira_seed_prefix_if_needed(const char *prefix_path);
+        if (madeira_seed_prefix_if_needed(prefix_path) != 0) {
+            wine_log_msg("Bundled Wine prefix could not be extracted");
+            return -2;
+        }
     }
 
     g_wineserver_running = 1;

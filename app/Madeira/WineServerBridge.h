@@ -7,7 +7,8 @@ extern "C" {
 
 // Start the wineserver on a background thread.
 // prefix_path: absolute path to the Wine prefix directory (e.g. app's Documents/wine)
-// Returns 0 on success, -1 on failure.
+// Returns 0 on success, -1 when the thread cannot start, or -2 when the
+// bundled Wine prefix could not be extracted.
 int wineserver_start(const char *prefix_path);
 
 // Check if wineserver is running

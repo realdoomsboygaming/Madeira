@@ -107,6 +107,79 @@ jobs:
           printf '%s\n' "$launch_status" > artifacts/simulator-smoke/launch-exit-status.txt
           exit "$launch_status"
 
+      - name: Build the production SwiftUI shell for Simulator diagnostics
+        id: shell-build
+        if: always()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          SHELL_BUILD="$RUNNER_TEMP/madeira-production-shell-products"
+          rm -rf "$SHELL_BUILD"
+          set +e
+          xcodebuild \
+            -project tests/ui-preview/LibraryPreview.xcodeproj \
+            -target LibraryPreview \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            CONFIGURATION_BUILD_DIR="$SHELL_BUILD" \
+            IPHONEOS_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            build 2>&1 | tee artifacts/simulator-smoke/shell-xcodebuild.log
+          status=${PIPESTATUS[0]}
+          printf '%s\n' "$status" > artifacts/simulator-smoke/shell-build-exit-status.txt
+          exit "$status"
+
+      - name: Launch the production SwiftUI shell in Simulator
+        id: shell-launch
+        if: always()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          mkdir -p artifacts/simulator-smoke
+          APP="$RUNNER_TEMP/madeira-production-shell-products/LibraryPreview.app"
+          if [ ! -d "$APP" ]; then
+            echo "Production shell was not produced; launch was not attempted" | tee artifacts/simulator-smoke/shell-launch.log
+            printf '%s\n' 90 > artifacts/simulator-smoke/shell-launch-exit-status.txt
+            exit 90
+          fi
+          udid="$(cat artifacts/simulator-smoke/device-udid.txt 2>/dev/null || true)"
+          if [ -z "$udid" ]; then
+            udid="$(xcrun simctl list devices available | grep 'iPhone' | grep -Eo '[0-9A-F-]{36}' | head -n1)"
+            printf '%s\n' "$udid" > artifacts/simulator-smoke/device-udid.txt
+          fi
+          if [ -z "$udid" ]; then
+            echo "No available iPhone simulator" | tee artifacts/simulator-smoke/shell-launch.log
+            printf '%s\n' 91 > artifacts/simulator-smoke/shell-launch-exit-status.txt
+            exit 91
+          fi
+          xcrun simctl boot "$udid" 2>/dev/null || true
+          xcrun simctl bootstatus "$udid" -b > artifacts/simulator-smoke/shell-boot.log 2>&1
+          set +e
+          xcrun simctl install "$udid" "$APP" 2>&1 | tee artifacts/simulator-smoke/shell-install.log
+          install_status=${PIPESTATUS[0]}
+          if [ "$install_status" -ne 0 ]; then
+            printf '%s\n' "$install_status" > artifacts/simulator-smoke/shell-launch-exit-status.txt
+            exit "$install_status"
+          fi
+          xcrun simctl spawn "$udid" log stream --style compact --level debug \
+            --predicate 'process == "LibraryPreview" OR eventMessage CONTAINS[c] "Madeira"' \
+            > artifacts/simulator-smoke/shell-live-log-stream.txt 2>&1 &
+          log_pid=$!
+          xcrun simctl launch "$udid" com.madeira.librarypreview 2>&1 | tee artifacts/simulator-smoke/shell-launch.log
+          launch_status=${PIPESTATUS[0]}
+          sleep 5
+          xcrun simctl io "$udid" screenshot artifacts/simulator-smoke/shell-library.png > artifacts/simulator-smoke/shell-library-screenshot.log 2>&1
+          xcrun simctl terminate "$udid" com.madeira.librarypreview >/dev/null 2>&1 || true
+          xcrun simctl launch "$udid" com.madeira.librarypreview --settings 2>&1 | tee artifacts/simulator-smoke/shell-settings-launch.log
+          settings_status=${PIPESTATUS[0]}
+          sleep 3
+          xcrun simctl io "$udid" screenshot artifacts/simulator-smoke/shell-settings.png > artifacts/simulator-smoke/shell-settings-screenshot.log 2>&1
+          kill "$log_pid" 2>/dev/null || true
+          wait "$log_pid" 2>/dev/null || true
+          if [ "$launch_status" -ne 0 ]; then status="$launch_status"; else status="$settings_status"; fi
+          printf '%s\n' "$status" > artifacts/simulator-smoke/shell-launch-exit-status.txt
+          exit "$status"
+
       - name: Collect Simulator logs and crash reports
         if: always()
         run: |
@@ -115,7 +188,7 @@ jobs:
           udid="$(cat artifacts/simulator-smoke/device-udid.txt 2>/dev/null || true)"
           if [ -n "$udid" ]; then
             xcrun simctl spawn "$udid" log show --style compact --last 10m \
-              --predicate 'process == "Madeira" OR eventMessage CONTAINS[c] "Madeira"' \
+            --predicate 'process == "Madeira" OR process == "LibraryPreview" OR eventMessage CONTAINS[c] "Madeira"' \
               > artifacts/simulator-smoke/simulator-log-show.txt 2>&1
             xcrun simctl spawn "$udid" launchctl print system \
               > artifacts/simulator-smoke/launchd-state.txt 2>&1
@@ -141,7 +214,13 @@ jobs:
         run: |
           build_status="$(cat artifacts/simulator-smoke/build-exit-status.txt 2>/dev/null || echo 92)"
           launch_status="$(cat artifacts/simulator-smoke/launch-exit-status.txt 2>/dev/null || echo 93)"
+          shell_build_status="$(cat artifacts/simulator-smoke/shell-build-exit-status.txt 2>/dev/null || echo 94)"
+          shell_launch_status="$(cat artifacts/simulator-smoke/shell-launch-exit-status.txt 2>/dev/null || echo 95)"
           echo "Real simulator build status: $build_status"
           echo "Real simulator launch status: $launch_status"
+          echo "Production shell build status: $shell_build_status"
+          echo "Production shell launch status: $shell_launch_status"
           if [ "$build_status" -ne 0 ]; then exit "$build_status"; fi
           if [ "$launch_status" -ne 0 ]; then exit "$launch_status"; fi
+          if [ "$shell_build_status" -ne 0 ]; then exit "$shell_build_status"; fi
+          if [ "$shell_launch_status" -ne 0 ]; then exit "$shell_launch_status"; fi

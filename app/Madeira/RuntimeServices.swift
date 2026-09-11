@@ -30,6 +30,7 @@ struct WineLaunchConfiguration: Equatable {
 enum RuntimeServiceError: LocalizedError {
     case jitUnavailable
     case jitPoolFailed
+    case bundledResourceMissing(String)
     case wineserverFailed(Int32)
     case wineFailed(Int32)
 
@@ -39,6 +40,8 @@ enum RuntimeServiceError: LocalizedError {
             return "JIT is unavailable. Enable JIT in Settings before launching Windows software."
         case .jitPoolFailed:
             return "Madeira could not allocate the JIT memory pool. Close other apps and try again."
+        case .bundledResourceMissing(let resource):
+            return "Madeira is missing bundled runtime content: \(resource). Reinstall the IPA instead of launching this incomplete build."
         case .wineserverFailed(let code):
             return "The Wine server could not start (error \(code))."
         case .wineFailed(let code):
@@ -80,6 +83,9 @@ final class RuntimeService: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             do {
+                try self.verifyBundledRuntime()
+                let prefix = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                    .appendingPathComponent("wine", isDirectory: true)
                 guard self.jit.isAvailable else { throw RuntimeServiceError.jitUnavailable }
                 guard self.jit.preparePool(megabytes: poolMB) else {
                     throw RuntimeServiceError.jitPoolFailed
@@ -88,8 +94,6 @@ final class RuntimeService: ObservableObject {
                 self.applyEnvironment(launch)
                 self.publish(.starting)
 
-                let prefix = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-                    .appendingPathComponent("wine", isDirectory: true)
                 let serverResult = wineserver_start(prefix.path)
                 guard serverResult == 0 else {
                     throw RuntimeServiceError.wineserverFailed(serverResult)
@@ -149,6 +153,31 @@ final class RuntimeService: ObservableObject {
         }
         for (key, value) in launch.environment where key != "MADEIRA_DESKTOP" {
             setenv(key, value, 1)
+        }
+    }
+
+    private func verifyBundledRuntime() throws {
+        let fm = FileManager.default
+        let bundleRoot = Bundle.main.bundleURL
+        let requiredDirectories = [
+            "aarch64-windows",
+            "arm64ec-windows",
+            "i386-windows",
+            "x86_64-vcruntime",
+            "nls"
+        ]
+        for name in requiredDirectories {
+            let url = bundleRoot.appendingPathComponent(name, isDirectory: true)
+            var isDirectory: ObjCBool = false
+            guard fm.fileExists(atPath: url.path, isDirectory: &isDirectory),
+                  isDirectory.boolValue,
+                  (try? fm.contentsOfDirectory(atPath: url.path).isEmpty) == false else {
+                throw RuntimeServiceError.bundledResourceMissing(name)
+            }
+        }
+
+        guard Bundle.main.url(forResource: "prefix-template", withExtension: "tar.gz") != nil else {
+            throw RuntimeServiceError.bundledResourceMissing("prefix-template.tar.gz")
         }
     }
 

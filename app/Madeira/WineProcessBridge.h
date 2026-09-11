@@ -13,6 +13,10 @@ int wine_process_start(const char *prefix_path);
 // Check if Wine process is running
 int wine_process_is_running(void);
 
+// Seed the bundled prefix before wineserver reads the registry. Returns 0 on
+// success and -1 when the template cannot be found or extracted.
+int madeira_seed_prefix_if_needed(const char *prefix_path);
+
 // Steam S0 net-test VPN gate: write C:\madeira-continue.flag into the
 // prefix's drive_c so the paused winhttp-test.exe resumes to the Steam
 // stage. Called by the "Continue Net Test" UI button after the user has

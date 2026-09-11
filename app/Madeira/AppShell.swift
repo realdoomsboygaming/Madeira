@@ -53,7 +53,14 @@ struct ContentView: View {
         .preferredColorScheme(.dark)
         .tint(MadeiraTheme.accent)
         .background(MadeiraTheme.background.ignoresSafeArea())
-        .onAppear { jit_install_trap_handler(); jit.refresh() }
+        .onAppear {
+            // Bring up the bounded file log before touching jailbreak/JIT
+            // helpers. A native failure after this point leaves a persistent
+            // startup marker even when the system crash reporter is absent.
+            LogStore.shared.log("Madeira UI started")
+            jit_install_trap_handler()
+            jit.refresh()
+        }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             jit.refresh()
             runtime.refresh()

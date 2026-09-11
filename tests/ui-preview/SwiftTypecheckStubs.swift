@@ -72,6 +72,7 @@ final class LogStore: ObservableObject {
         var count = 1
     }
     @Published var entries: [LogEntry] = []
+    func log(_ message: String, level: LogEntry.Level = .info) {}
     func clear() { entries.removeAll() }
 }
 

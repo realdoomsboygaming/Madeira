@@ -693,6 +693,17 @@ jobs:
             test -f "app/Madeira/$l.a" || { echo "MISSING app/Madeira/$l.a"; exit 1; }
             ls -lh "app/Madeira/$l.a"
           done
+      - name: Verify bundled runtime resources before Xcode
+        run: |
+          set -euo pipefail
+          for dir in aarch64-windows arm64ec-windows i386-windows x86_64-vcruntime nls; do
+            path="app/Madeira/$dir"
+            test -d "$path" || { echo "MISSING bundled directory: $path"; exit 1; }
+            count="$(find "$path" -type f | wc -l | tr -d ' ')"
+            test "$count" -gt 0 || { echo "EMPTY bundled directory: $path"; exit 1; }
+            echo "$path: $count files"
+          done
+          test -s app/Madeira/prefix-template.tar.gz
       # ==============================================================
       # APP — xcodebuild auto-creates a scheme from the target even
       # though the project ships no xcshareddata/xcschemes, so -target
@@ -720,6 +731,11 @@ jobs:
           test -f out/Madeira.app/aarch64-windows/xtajit.dll
           test -f out/Madeira.app/i386-windows/ntdll.dll
           test -f out/Madeira.app/i386-windows/kernel32.dll
+          for dir in aarch64-windows arm64ec-windows i386-windows x86_64-vcruntime nls; do
+            test -d "out/Madeira.app/$dir"
+            test "$(find "out/Madeira.app/$dir" -type f | wc -l | tr -d ' ')" -gt 0
+          done
+          test -s out/Madeira.app/prefix-template.tar.gz
           PAGEZERO_SIZE="$(xcrun otool -l out/Madeira.app/Madeira | awk '
             /segname __PAGEZERO/ { found=1; next }
             found && /vmsize/ { print $2; exit }
@@ -745,6 +761,14 @@ jobs:
           cp -R out/Madeira.app artifacts/Payload/Madeira.app
           cd artifacts && zip -qry Madeira.ipa Payload
           unzip -l Madeira.ipa | grep -q "Payload/Madeira.app/Madeira"
+          for path in \
+            Payload/Madeira.app/prefix-template.tar.gz \
+            Payload/Madeira.app/aarch64-windows/xtajit.dll \
+            Payload/Madeira.app/arm64ec-windows/ntdll.dll \
+            Payload/Madeira.app/i386-windows/ntdll.dll \
+            Payload/Madeira.app/x86_64-vcruntime/vcruntime140_1.dll; do
+            unzip -l Madeira.ipa | grep -q "$path" || { echo "IPA missing $path"; exit 1; }
+          done
           ls -lh Madeira.ipa
       - name: Upload
         if: always()

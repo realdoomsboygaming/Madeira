@@ -366,10 +366,11 @@ static unsigned short madeira_target_pe_machine(const char *exe)
  * ActivatableClassId (Thumper aborts on RoGetActivationFactory for
  * Windows.Gaming.Input.Gamepad), and no Fonts keys (the #61/#70 dwrite fix).
  */
-void madeira_seed_prefix_if_needed(const char *prefix_path) {
+int madeira_seed_prefix_if_needed(const char *prefix_path) {
     @autoreleasepool {
-        if (!prefix_path) return;
+        if (!prefix_path) return -1;
         NSString *prefix = [NSString stringWithUTF8String:prefix_path];
+        if (!prefix) return -1;
         NSString *stamp = [prefix stringByAppendingPathComponent:@".update-timestamp"];
         NSFileManager *fm = [NSFileManager defaultManager];
 
@@ -379,10 +380,12 @@ void madeira_seed_prefix_if_needed(const char *prefix_path) {
             NSString *tgz = [[NSBundle mainBundle] pathForResource:@"prefix-template" ofType:@"tar.gz"];
             if (!tgz) {
                 LOG("prefix-template.tar.gz missing from bundle!");
+                return -1;
             } else {
                 LOG("Seeding prefix from %{public}s", tgz.UTF8String);
                 if (madeira_extract_prefix_tgz(tgz.UTF8String, prefix_path) != 0) {
                     LOG("prefix extraction FAILED");
+                    return -1;
                 } else {
                     LOG("prefix seeded to %{public}s", prefix_path);
                 }
@@ -403,6 +406,7 @@ void madeira_seed_prefix_if_needed(const char *prefix_path) {
         /* ml581: see madeira_undo_appdata_skeleton() above. */
         madeira_undo_appdata_skeleton( prefix );
     }
+    return 0;
 }
 
 static void *wine_process_thread(void *arg) {

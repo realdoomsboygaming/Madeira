@@ -47,7 +47,11 @@ struct EntitlementStatus {
             extendedVA: checkAppEntitlement("com.apple.developer.kernel.extended-virtual-addressing"),
             jailbroken: jailbroken,
             automaticJIT: jailbroken && madeira_jb_jit_available(),
-            automaticMemory: madeira_jb_increase_memory_limit()
+            // The private memorystatus call is only meaningful on the
+            // jailbreak path. Do not probe it during normal signed startup;
+            // some builds terminate the process before UIKit can report a
+            // useful error when that private call is attempted.
+            automaticMemory: jailbroken ? madeira_jb_increase_memory_limit() : false
         )
     }
 }
