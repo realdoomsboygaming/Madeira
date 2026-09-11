@@ -412,7 +412,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_ENTITLEMENTS = Madeira/Madeira.entitlements;
+				CODE_SIGN_ENTITLEMENTS = "$(MADEIRA_ENTITLEMENTS_FILE)";
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
@@ -448,6 +448,7 @@
 					"$(SRCROOT)/Madeira",
 				);
 				MARKETING_VERSION = 0.1.0;
+				MADEIRA_ENTITLEMENTS_FILE = Madeira/Madeira.entitlements;
 				PRODUCT_BUNDLE_IDENTIFIER = com.willfaust.mythicemu;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -464,7 +465,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_ENTITLEMENTS = Madeira/Madeira.entitlements;
+				CODE_SIGN_ENTITLEMENTS = "$(MADEIRA_ENTITLEMENTS_FILE)";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = UT49TA9TA4;
@@ -499,6 +500,7 @@
 					"$(SRCROOT)/Madeira",
 				);
 				MARKETING_VERSION = 0.1.0;
+				MADEIRA_ENTITLEMENTS_FILE = Madeira/Madeira.entitlements;
 				PRODUCT_BUNDLE_IDENTIFIER = com.willfaust.mythicemu;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";

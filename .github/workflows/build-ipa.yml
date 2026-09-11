@@ -7,6 +7,10 @@ on:
         description: Run PMR regression tests before building
         type: boolean
         default: true
+      jailbreak_build:
+        description: Build with the jailbreak entitlement configuration
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -14,6 +18,7 @@ permissions:
 env:
   DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
   IOS_DEPLOYMENT_TARGET: "16.4"
+  MADEIRA_ENTITLEMENTS_FILE: ${{ inputs.jailbreak_build && 'Madeira/Madeira.jailbreak.entitlements' || 'Madeira/Madeira.entitlements' }}
   MINGW: llvm-mingw-20260421-ucrt-macos-universal
   # bump to invalidate every cache at once
   CACHE_V: "1"
@@ -642,6 +647,7 @@ jobs:
             -sdk iphoneos \
             CONFIGURATION_BUILD_DIR="$PWD/out" \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            MADEIRA_ENTITLEMENTS_FILE="$MADEIRA_ENTITLEMENTS_FILE" \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             build
       - name: Check iOS 16 PMR compatibility
@@ -670,6 +676,7 @@ jobs:
           name: Madeira
           path: |
             artifacts/Madeira.ipa
+            app/Madeira/Madeira.jailbreak.entitlements
             /tmp/fex.log
             wine/build-macos/config.log
             research/dxmt/build-pe/meson-logs/**

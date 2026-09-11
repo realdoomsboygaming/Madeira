@@ -40,6 +40,40 @@ git clone --recurse-submodules <this repo>
 Note that `FEX`, `wine` and `research/dxmt` are submodules pointing at forks
 containing the iOS work; upstream clones will not build here.
 
+### Jailbroken builds
+
+The public `com.apple.developer.kernel.increased-memory-limit` entitlement is
+not what authorizes the jailbreak memory override. On a jailbroken device,
+Madeira calls the private `memorystatus_control` API and verifies the accepted
+limit with a readback request. The call succeeds only when the installed
+package preserves the private entitlement or the jailbreak supplies equivalent
+root/task authorization.
+
+The normal build deliberately uses `Madeira.entitlements`, which does not list
+the private entitlement and remains compatible with ordinary Apple signing. A
+jailbreak/fakesigned build can select the separate plist:
+
+```sh
+xcodebuild \
+  -project app/Madeira.xcodeproj \
+  -target Madeira \
+  -configuration Release \
+  MADEIRA_ENTITLEMENTS_FILE=Madeira/Madeira.jailbreak.entitlements \
+  CODE_SIGNING_ALLOWED=NO \
+  CODE_SIGNING_REQUIRED=NO \
+  build
+```
+
+The resulting app must then be signed/installed by a jailbreak-aware signing
+workflow that preserves `Madeira.jailbreak.entitlements`. App installation
+bypass alone does not prove that private entitlements became effective.
+
+If the runtime log reports `EPERM`, the package was not installed with an
+effective jailbreak entitlement/privilege; increasing the pool size will not
+fix that authorization failure. If the readback succeeds but Jetsam still
+terminates the app, the remaining limit is physical residency rather than
+entitlement authorization.
+
 ## License
 
 **GPL-3.0-or-later** — see [`LICENSE`](LICENSE). Derivatives that are

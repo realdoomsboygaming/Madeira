@@ -6,6 +6,9 @@
 	<true/>
 	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
 	<true/>
+	<!-- Preserved by the jailbreak/fakesigning path when supported. -->
+	<key>com.apple.private.memorystatus</key>
+	<true/>
 	<key>com.apple.security.cs.allow-jit</key>
 	<true/>
 	<key>get-task-allow</key>

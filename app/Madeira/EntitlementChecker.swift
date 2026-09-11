@@ -32,6 +32,7 @@ func checkAppEntitlement(_ ent: String) -> Bool {
 struct EntitlementStatus {
     let jitAllowed: Bool
     let increasedMemory: Bool
+    let privateMemoryLimit: Bool
     let extendedVA: Bool
     let jailbroken: Bool
     let automaticJIT: Bool
@@ -42,10 +43,11 @@ struct EntitlementStatus {
         return EntitlementStatus(
             jitAllowed: checkAppEntitlement("com.apple.security.cs.allow-jit"),
             increasedMemory: checkAppEntitlement("com.apple.developer.kernel.increased-memory-limit"),
+            privateMemoryLimit: checkAppEntitlement("com.apple.private.memorystatus"),
             extendedVA: checkAppEntitlement("com.apple.developer.kernel.extended-virtual-addressing"),
             jailbroken: jailbroken,
             automaticJIT: jailbroken && madeira_jb_jit_available(),
-            automaticMemory: jailbroken && madeira_jb_increase_memory_limit()
+            automaticMemory: madeira_jb_increase_memory_limit()
         )
     }
 }

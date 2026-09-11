@@ -1014,7 +1014,7 @@ struct ContentView: View {
 
     private func logEntitlementStatus() {
         guard let ents = entitlements else { return }
-        logStore.log("JIT: \(jitReady); increased-memory-limit: \(ents.increasedMemory); extended-virtual-addressing: \(ents.extendedVA)")
+        logStore.log("JIT: \(jitReady); increased-memory-limit: \(ents.increasedMemory); private memorystatus: \(ents.privateMemoryLimit); extended-virtual-addressing: \(ents.extendedVA)")
         logStore.log("Jailbreak: \(ents.jailbroken); automatic JIT: \(ents.automaticJIT); memory override: \(ents.automaticMemory)")
     }
 

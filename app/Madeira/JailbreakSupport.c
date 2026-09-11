@@ -38,6 +38,7 @@
 
 // Private iOS API used by jailbreaks and by UTM's jailbreak support.
 #define MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES 7
+#define MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES 8
 #define MADEIRA_MEMLIMIT_GIB 1024
 
 typedef struct memorystatus_memlimit_properties {
@@ -251,14 +252,15 @@ bool madeira_jb_increase_memory_limit(void) {
 #if TARGET_OS_OSX || TARGET_OS_SIMULATOR
     return false;
 #else
-    if (!madeira_jb_is_jailbroken()) return false;
-
-    // 1 TiB is an upper bound, not an allocation. The kernel clamps it to the
-    // device's usable limit. This is the same memorystatus request used by
-    // UTM's jailbreak support and raises the Jetsam ceiling for FEX/Wine.
+    // 1 TiB is an upper bound, not an allocation. The kernel applies the
+    // device's own limits and pressure policy. On a jailbroken build, success requires either
+    // root-equivalent execution or an effective private memorystatus
+    // entitlement. Do not gate this attempt on jailbreak heuristics: rootless
+    // injection can be present without exposing a recognizable image/path.
     memorystatus_memlimit_properties_t properties = {0};
     properties.memlimit_active = 1024 * MADEIRA_MEMLIMIT_GIB;
     properties.memlimit_inactive = 1024 * MADEIRA_MEMLIMIT_GIB;
+    errno = 0;
     int result = memorystatus_control(MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES,
                                        getpid(), 0,
                                        (user_addr_t)(uintptr_t)&properties,
@@ -270,14 +272,40 @@ bool madeira_jb_increase_memory_limit(void) {
         jb_log(message);
         return false;
     }
-    jb_log("jailbreak memory-limit request accepted");
+
+    // A successful setter only proves that the kernel accepted the request.
+    // Read it back so the log distinguishes an effective jailbreak build from
+    // a build whose source plist merely mentioned the private entitlement.
+    memorystatus_memlimit_properties_t applied = {0};
+    errno = 0;
+    int readback = memorystatus_control(MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES,
+                                         getpid(), 0,
+                                         (user_addr_t)(uintptr_t)&applied,
+                                         sizeof(applied));
+    if (readback != 0) {
+        char message[192];
+        snprintf(message, sizeof(message),
+                 "memory-limit request accepted but readback failed: %s",
+                 strerror(errno));
+        jb_log(message);
+        return false;
+    }
+
+    char message[192];
+    snprintf(message, sizeof(message),
+             "jailbreak memory limit active=%d MB inactive=%d MB",
+             applied.memlimit_active, applied.memlimit_inactive);
+    jb_log(message);
     return true;
 #endif
 }
 
 bool madeira_jb_initialize(void) {
-    if (!madeira_jb_is_jailbroken()) return false;
-    bool jit = madeira_jb_enable_jit();
+    // Memory-limit authorization and JIT authorization are independent. The
+    // memory request is attempted even when jailbreak detection is incomplete;
+    // a normally signed process simply receives EPERM. JIT still stays behind
+    // the jailbreak check because its self-debug path changes process state.
     bool memory = madeira_jb_increase_memory_limit();
+    bool jit = madeira_jb_is_jailbroken() && madeira_jb_enable_jit();
     return jit || memory;
 }
