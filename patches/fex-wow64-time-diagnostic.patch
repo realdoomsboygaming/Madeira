@@ -1,0 +1,21 @@
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 61552a1..09ca507 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -1999,12 +1999,10 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+       }
+ 
+       if ((n & 0xFFF) == 0) {
+-        /* Wall-clock elapsed since first HOT sum — answers "is the game
+-         * still alive at minute N?" Uses time(NULL) for second resolution. */
+-        static volatile uint64_t s_start_secs = 0;
+-        uint64_t now = (uint64_t)time(NULL);
+-        if (s_start_secs == 0) s_start_secs = now;
+-        uint64_t elapsed = now - s_start_secs;
++        /* The WoW64 DLL intentionally links without a Windows CRT. Use the
++         * existing bounded counter as elapsed diagnostic units instead of
++         * pulling in the unavailable _time64 symbol. */
++        uint64_t elapsed = n >> 12;
+         LogMan::Msg::EFmt("[HOT sum t={}s] 6fe6={} 6feb={} 28d20={} 28d41={} 28d46={} 687f0={} 68816={} "
+                            "fmod27a={} fmod2fa={} fmod9d4={} fmod9e3={} fmodNear={} "
+                            "max_alloc=0x{:x} crsp[min..last..max]=0x{:x}..0x{:x}..0x{:x} "

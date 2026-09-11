@@ -431,6 +431,8 @@ jobs:
           grep -n -A4 "MADEIRA_CASPAL_STUB" FEX/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
           git -C FEX apply --check ../patches/fex-wow64-diagnostic-guards.patch
           git -C FEX apply ../patches/fex-wow64-diagnostic-guards.patch
+          git -C FEX apply --check ../patches/fex-wow64-time-diagnostic.patch
+          git -C FEX apply ../patches/fex-wow64-time-diagnostic.patch
       - name: Configure FEX
         if: steps.fex.outputs.cache-hit != 'true'
         run: |
