@@ -24,7 +24,7 @@ env:
   MADEIRA_WOW64_LDFLAGS: "-Wl,-pagezero_size,0"
   MINGW: llvm-mingw-20260421-ucrt-macos-universal
   # bump to invalidate every cache at once
-  CACHE_V: "2"
+  CACHE_V: "3"
 
 jobs:
   build:
@@ -230,7 +230,19 @@ jobs:
             --enable-archs=i386 \
             --disable-tests --without-x --without-freetype
           test -f include/config.h
-          make -k -j"$(sysctl -n hw.ncpu)" 2>&1 | tail -40 || true
+          make -k -j"$(sysctl -n hw.ncpu)" 2>&1 | tee /tmp/wine-i386.log | tail -40 || true
+          echo "=== i386 PE build diagnostics ==="
+          grep -nE 'error:|undefined reference|cannot find|not found' /tmp/wine-i386.log | tail -80 || true
+          # The default aggregate target can stop after unrelated host-side
+          # failures. Build the loader-critical PE images as explicit targets
+          # so a partial make cannot silently leave WoW64 without ntdll or
+          # kernel32.
+          for target in \
+            dlls/ntdll/i386-windows/ntdll.dll \
+            dlls/kernelbase/i386-windows/kernelbase.dll \
+            dlls/kernel32/i386-windows/kernel32.dll; do
+            make -k -j"$(sysctl -n hw.ncpu)" "$target" 2>&1 | tee "/tmp/wine-i386-$(basename "$target").log" | tail -40 || true
+          done
           echo "=== 32-bit i386 PE build complete; host-side failures remain non-fatal ==="
       - name: Verify Wine outputs + wire up build-arm64ec
         run: |
@@ -259,7 +271,7 @@ jobs:
           echo "build-arm64ec -> $(readlink wine/build-arm64ec)"
           rm -rf app/Madeira/i386-windows
           mkdir -p app/Madeira/i386-windows
-          find wine/build-i386 -type f -path '*/i386-windows/*' -exec cp -f {} app/Madeira/i386-windows/ \;
+          find wine/build-i386 -type f -iname '*.dll' -exec cp -f {} app/Madeira/i386-windows/ \;
           test -f app/Madeira/i386-windows/ntdll.dll
           test -f app/Madeira/i386-windows/kernel32.dll
           echo "=== staged i386 PE modules ==="
@@ -758,6 +770,7 @@ jobs:
             app/Madeira/Madeira.jailbreak.entitlements
             /tmp/fex.log
             /tmp/fex-wow64.log
+            /tmp/wine-i386*.log
             wine/build-macos/config.log
             wine/build-i386/config.log
             research/dxmt/build-pe/meson-logs/**
