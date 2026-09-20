@@ -126,64 +126,48 @@ const char *jit_backend_name(void) {
     return uses_ios26_brk_protocol() ? "ios26-brk-dualmap" : "ios16-legacy-dualmap";
 }
 
-/* iOS 16 backend: create anonymous RW storage, widen only its maximum
- * protection while CS_DEBUGGED is active, then create a second alias and make
- * the aliases disjoint in their current protections. There is never a
+/* iOS 16 backend: create the anonymous source mapping as RX, create a second
+ * alias from that executable mapping, then lower the source view to RW. iOS
+ * 16 accepts this debugger-backed transition, but rejects the inverse shape
+ * (RW first, then adding X to the remapped alias) with
+ * KERN_PROTECTION_FAILURE even while CS_DEBUGGED is set. There is never a
  * production RWX mapping and no private ledger flag is required. */
 static bool legacy_dualmap_create(size_t size, void **rx_out, void **rw_out) {
     mach_port_t task = mach_task_self();
-    void *rw = mmap(NULL, size, PROT_READ | PROT_WRITE,
+    void *rx = mmap(NULL, size, PROT_READ | PROT_EXEC,
                     MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (rw == MAP_FAILED) {
-        jit_log("legacy mmap(RW) failed: errno=%d", errno);
+    if (rx == MAP_FAILED) {
+        jit_log("legacy mmap(RX) failed: errno=%d", errno);
         return false;
     }
 
-    kern_return_t kr = vm_protect(task, (vm_address_t)rw, size, TRUE,
-                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-    if (kr != KERN_SUCCESS) {
-        log_kr("legacy vm_protect(max=RWX)", kr);
-        int rc = munmap(rw, size);
-        if (rc) jit_log("legacy munmap(RW) cleanup failed: errno=%d", errno);
-        return false;
-    }
-
-    vm_address_t rx_addr = 0;
+    vm_address_t rw_addr = 0;
     vm_prot_t source_current = 0, source_max = 0;
-    kr = vm_remap(task, &rx_addr, size, 0, VM_FLAGS_ANYWHERE, task,
-                  (vm_address_t)rw, FALSE, &source_current, &source_max,
+    kern_return_t kr = vm_remap(task, &rw_addr, size, 0, VM_FLAGS_ANYWHERE, task,
+                  (vm_address_t)rx, FALSE, &source_current, &source_max,
                   VM_INHERIT_NONE);
     if (kr != KERN_SUCCESS) {
-        log_kr("legacy vm_remap(RX alias)", kr);
-        kr = vm_protect(task, (vm_address_t)rw, size, TRUE,
-                        VM_PROT_READ | VM_PROT_WRITE);
-        if (kr != KERN_SUCCESS) log_kr("legacy vm_protect(RW rollback)", kr);
-        if (munmap(rw, size)) jit_log("legacy munmap(RW) cleanup failed: errno=%d", errno);
+        log_kr("legacy vm_remap(RW alias)", kr);
+        if (munmap(rx, size)) jit_log("legacy munmap(RX) cleanup failed: errno=%d", errno);
         return false;
     }
+    jit_log("legacy vm_remap alias protections: current=0x%x max=0x%x",
+            source_current, source_max);
 
-    kr = vm_protect(task, rx_addr, size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+    kr = vm_protect(task, (vm_address_t)rx, size, FALSE,
+                    VM_PROT_READ | VM_PROT_WRITE);
     if (kr != KERN_SUCCESS) {
-        log_kr("legacy vm_protect(RX)", kr);
-        kern_return_t cleanup = vm_deallocate(task, rx_addr, size);
-        if (cleanup != KERN_SUCCESS) log_kr("legacy vm_deallocate(RX) cleanup", cleanup);
-        if (munmap(rw, size)) jit_log("legacy munmap(RW) cleanup failed: errno=%d", errno);
+        log_kr("legacy vm_protect(RW source)", kr);
+        kern_return_t cleanup = vm_deallocate(task, rw_addr, size);
+        if (cleanup != KERN_SUCCESS) log_kr("legacy vm_deallocate(RW) cleanup", cleanup);
+        if (munmap(rx, size)) jit_log("legacy munmap(RX) cleanup failed: errno=%d", errno);
         return false;
     }
 
-    kr = vm_protect(task, (vm_address_t)rw, size, FALSE, VM_PROT_READ | VM_PROT_WRITE);
-    if (kr != KERN_SUCCESS) {
-        log_kr("legacy vm_protect(RW)", kr);
-        kern_return_t cleanup = vm_deallocate(task, rx_addr, size);
-        if (cleanup != KERN_SUCCESS) log_kr("legacy vm_deallocate(RX) cleanup", cleanup);
-        if (munmap(rw, size)) jit_log("legacy munmap(RW) cleanup failed: errno=%d", errno);
-        return false;
-    }
-
-    *rx_out = (void *)rx_addr;
-    *rw_out = rw;
-    jit_log("legacy dual-map ready: RW=%p RX=%p size=%zu page=%zu max=RWX current={RW,RX}",
-            rw, (void *)rx_addr, size, jit_page_size());
+    *rx_out = (void *)rw_addr;
+    *rw_out = rx;
+    jit_log("legacy dual-map ready: RW=%p RX=%p size=%zu page=%zu current={RW,RX}",
+            rx, (void *)rw_addr, size, jit_page_size());
     return true;
 }
 

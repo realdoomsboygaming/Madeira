@@ -1123,7 +1123,16 @@ struct ContentView: View {
     private func logEntitlementStatus() {
         guard let ents = entitlements else { return }
         logStore.log("Checking entitlements...")
-        logStore.log("  allow-jit: \(ents.jitAllowed)", level: ents.jitAllowed ? .success : .error)
+        // iOS 16's jailbroken/TrollStore path uses the external debugger to
+        // set CS_DEBUGGED; it does not require the MAP_JIT entitlement. Keep
+        // a missing allow-jit entitlement visible without reporting it as a
+        // blocker on that legacy path.
+        let legacyDebuggerJIT = ProcessInfo.processInfo.operatingSystemVersion.majorVersion < 26
+        let jitLevel: LogStore.LogEntry.Level = ents.jitAllowed ? .success : (legacyDebuggerJIT ? .debug : .error)
+        logStore.log("  allow-jit: \(ents.jitAllowed)", level: jitLevel)
+        if !ents.jitAllowed && legacyDebuggerJIT {
+            logStore.log("  iOS 16 legacy JIT uses CS_DEBUGGED from the external debugger", level: .info)
+        }
         logStore.log("  increased-memory-limit: \(ents.increasedMemory)", level: ents.increasedMemory ? .success : .debug)
         logStore.log("  extended-virtual-addressing: \(ents.extendedVA)", level: ents.extendedVA ? .success : .debug)
         if !ents.extendedVA {
