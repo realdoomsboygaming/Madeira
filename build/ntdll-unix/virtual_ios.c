@@ -4774,6 +4774,33 @@ void *anon_mmap_fixed( void *start, size_t size, int prot, int flags )
     assert( !(size & host_page_mask) );
 
     ios_jit_range_tripwire( "anon_mmap_fixed", start, size, prot, __builtin_return_address(0) );
+
+#ifdef WINE_IOS
+    /* A PROT_NONE reservation is still a live Mach region.  Plain mmap()
+     * commonly gives that region max_protection=0 on iOS, so a later commit
+     * cannot raise it back to READ/WRITE and the Wine view is left logically
+     * committed but physically unreadable.  Map the guard with no current
+     * access but VM_PROT_ALL as its ceiling; vm_protect(...,TRUE,...) is not
+     * needed and this also preserves the MAP_FIXED replacement semantics used
+     * by unmap_area(). */
+    if (prot == PROT_NONE)
+    {
+        mach_vm_address_t address = (mach_vm_address_t)(uintptr_t)start;
+        kern_return_t kr = mach_vm_map( mach_task_self(), &address, size, 0,
+                                        VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                                        MEMORY_OBJECT_NULL, 0, 0, prot,
+                                        VM_PROT_ALL, VM_INHERIT_COPY );
+        if (kr != KERN_SUCCESS || address != (mach_vm_address_t)(uintptr_t)start)
+        {
+            errno = (kr == KERN_NO_SPACE ? EEXIST : ENOMEM);
+            dprintf(2, "[vmem-denied] iOS PROT_NONE reservation failed: addr=%p size=0x%lx kr=%d\n",
+                    start, (unsigned long)size, kr);
+            return MAP_FAILED;
+        }
+        return start;
+    }
+#endif
+
     return mmap( start, size, prot, MAP_PRIVATE | MAP_ANON | MAP_FIXED | flags, -1, 0 );
 }
 
@@ -8044,6 +8071,27 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     }
                 }
 
+                /* mprotect_exec reaches this anonymous-alias path while
+                 * virtual_mutex is held.  A fixed overwrite over a live image
+                 * or file view would replace Wine's mapping with an anonymous
+                 * JIT view, while the view tree and per-page vprot table still
+                 * describe the old object.  That is exactly the provenance
+                 * mismatch behind anonymous prot=0/max=0 pages reported inside
+                 * Wine image views.  Anonymous SEC_RESERVE/SEC_COMMIT views are
+                 * valid JIT targets; image/file views are not. */
+                {
+                    struct file_view *overlap = find_view_range( base, alloc_size );
+                    if (overlap && (overlap->protect & (SEC_IMAGE | SEC_FILE)))
+                    {
+                        dprintf(2, "[jit-remap-denied] refusing fixed overwrite %p+0x%lx over Wine view %p+0x%lx protect=0x%x\n",
+                                base, (unsigned long)alloc_size, overlap->base,
+                                (unsigned long)overlap->size, overlap->protect);
+                        mprotect( base, size, PROT_READ );
+                        errno = EEXIST;
+                        return -1;
+                    }
+                }
+
                 size_t offset = ios_pool_alloc_range(alloc_size, jit_pool_size - ios_jit_tail_reserved);
                 if (offset == (size_t)-1)
                 {
@@ -8121,7 +8169,8 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     ERR("iOS JIT: anon RWX vm_remap failed kr=%d %p+0x%lx\n",
                         kr, base, (unsigned long)alloc_size);
                     mprotect( base, size, PROT_READ );
-                    return 0;
+                    errno = EACCES;
+                    return -1;
                 }
 
                 /* iOS needs an explicit vm_protect to activate EXEC on the
@@ -8136,6 +8185,9 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     {
                         ERR("iOS JIT: anon RWX vm_protect(R+X) failed kr=%d %p+0x%lx\n",
                             pkr, base, (unsigned long)alloc_size);
+                        mprotect( base, size, PROT_READ );
+                        errno = EACCES;
+                        return -1;
                     }
                 }
 
@@ -9127,6 +9179,35 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
  */
 static BOOL set_vprot( struct file_view *view, void *base, size_t size, BYTE vprot )
 {
+    size_t first_page, last_page, page_count, i;
+    BYTE *old_vprot;
+    int host_status;
+
+    /* Keep the logical page table transactional with the host mapping.  The
+     * protection range may contain mixed 4-KB Wine pages inside one 16-KB iOS
+     * host page, and mprotect_range() can successfully process an initial run
+     * before failing on a later run.  Without a snapshot, a failed request
+     * leaves Wine reporting the new protection while Mach still has the old
+     * (or PROT_NONE) mapping. */
+    first_page = (size_t)base >> page_shift;
+    if ((size_t)base > (size_t)-1 - size - page_mask)
+    {
+        dprintf(2, "[vmem-denied] protection range overflow: base=%p size=0x%lx\n",
+                base, (unsigned long)size);
+        return FALSE;
+    }
+    last_page = ((size_t)base + size + page_mask) >> page_shift;
+    page_count = last_page - first_page;
+    if (page_count > (size_t)-1 / sizeof(*old_vprot) ||
+        !(old_vprot = malloc( page_count * sizeof(*old_vprot) )))
+    {
+        dprintf(2, "[vmem-denied] protection snapshot allocation failed: base=%p size=0x%lx pages=%lu\n",
+                base, (unsigned long)size, (unsigned long)page_count);
+        return FALSE;
+    }
+    for (i = 0; i < page_count; i++)
+        old_vprot[i] = get_page_vprot( (const void *)(uintptr_t)((first_page + i) << page_shift) );
+
     if (!use_kernel_writewatch && view->protect & VPROT_WRITEWATCH)
     {
         /* each page may need different protections depending on write watch flag */
@@ -9138,7 +9219,27 @@ static BOOL set_vprot( struct file_view *view, void *base, size_t size, BYTE vpr
         else if (use_kernel_writewatch && view->protect & VPROT_WRITEWATCH) vprot &= ~VPROT_WRITEWATCH;
         set_page_vprot( base, size, vprot );
     }
-    return !mprotect_range( base, size, 0, 0 );
+
+    host_status = mprotect_range( base, size, 0, 0 );
+    if (!host_status)
+    {
+        free( old_vprot );
+        return TRUE;
+    }
+
+    /* Restore the exact per-page logical state before trying to restore the
+     * corresponding host protection.  The second mprotect_range() is best
+     * effort: if the original mapping is already unrecoverable, the caller
+     * still receives failure instead of a false-success logical state. */
+    for (i = 0; i < page_count; i++)
+        set_page_vprot( (const void *)(uintptr_t)((first_page + i) << page_shift),
+                        page_size, old_vprot[i] );
+    free( old_vprot );
+
+    if (mprotect_range( base, size, 0, 0 ))
+        dprintf(2, "[vmem-denied] protection rollback host restore failed: base=%p size=0x%lx\n",
+                base, (unsigned long)size);
+    return FALSE;
 }
 
 
@@ -9845,6 +9946,42 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start
     return map_file_into_view_ex( view, fd, start, size, offset, vprot, removable, TRUE );
 }
 
+#ifdef WINE_IOS
+/* mmap() is not enough evidence on the legacy iOS path: a fixed mapping can
+ * report success while the resulting Mach region is still inaccessible (or
+ * has a zero protection ceiling).  Do not let the Wine view tree record a
+ * file-backed mapping until the kernel agrees with the requested protection. */
+static BOOL ios_verify_file_mapping( void *base, size_t size, int required,
+                                     const char *kind )
+{
+    mach_vm_address_t query = (mach_vm_address_t)(uintptr_t)base;
+    mach_vm_size_t region_size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object_name = MACH_PORT_NULL;
+    kern_return_t kr = mach_vm_region( mach_task_self(), &query, &region_size,
+                                       VM_REGION_BASIC_INFO_64,
+                                       (vm_region_info_t)&info, &info_count,
+                                       &object_name );
+    mach_vm_address_t end = (mach_vm_address_t)(uintptr_t)base + size;
+    mach_vm_address_t region_end = query + region_size;
+
+    if (kr != KERN_SUCCESS || query > (mach_vm_address_t)(uintptr_t)base ||
+        region_end < end || (info.protection & required) != required ||
+        (info.max_protection & required) != required)
+    {
+        dprintf( 2, "[vmem-denied] %s mapping verification failed: base=%p size=0x%lx "
+                 "kr=%d region=%p+0x%llx prot=0x%x max=0x%x required=0x%x\n",
+                 kind, base, (unsigned long)size, kr,
+                 (void *)(uintptr_t)query, (unsigned long long)region_size,
+                 kr == KERN_SUCCESS ? info.protection : 0,
+                 kr == KERN_SUCCESS ? info.max_protection : 0, required );
+        return FALSE;
+    }
+    return TRUE;
+}
+#endif
+
 /* ml561 (Sol's provenance recorder): remember HOW each file mapping was made.
  *
  * ml554 and ml559 both faulted at EXACTLY view_base+0x10000 — the 64KB Windows
@@ -10057,6 +10194,14 @@ static NTSTATUS map_file_into_view_ex( struct file_view *view, int fd, size_t st
         }
         if (mmap( host_addr, host_size, prot, flags, fd, offset ) != MAP_FAILED)
         {
+#ifdef WINE_IOS
+            if (!ios_verify_file_mapping( host_addr, host_size, prot, "file" ))
+            {
+                munmap( host_addr, host_size );
+                errno = EACCES;
+                return STATUS_ACCESS_DENIED;
+            }
+#endif
             ios_map_record( view->base, view->size, start, size, map_size, host_size,
                             fd, (long long)offset, (flags & MAP_SHARED) != 0, for_image );
             return STATUS_SUCCESS;
@@ -10096,8 +10241,45 @@ static NTSTATUS map_file_into_view_ex( struct file_view *view, int fd, size_t st
         return STATUS_INVALID_PARAMETER;
     }
 
-    mprotect( map_addr, map_size, PROT_READ | PROT_WRITE );
-    pread( fd, map_addr, size, offset );
+    /* The fallback is reached when the Wine page/file offset is not aligned
+     * enough for mmap().  On iOS the host page is 16 KB, so using the Wine
+     * page-aligned map_addr/map_size here can itself make mprotect fail with
+     * EINVAL.  Widen the temporary writable window to the host-page bounds,
+     * then refuse success if either operation failed.  Returning success while
+     * the reservation is still PROT_NONE leaves a committed Wine view whose
+     * Mach region reports prot=0/max=0 and causes a later, much less useful
+     * fault in Apple's memcpy/memmove path. */
+    if (mprotect( host_addr, host_size, PROT_READ | PROT_WRITE ))
+    {
+        dprintf(2, "[vmem-denied] unaligned file fallback mprotect failed: addr=%p size=0x%lx errno=%d (%s)\n",
+                host_addr, (unsigned long)host_size, errno, strerror(errno));
+        return STATUS_ACCESS_DENIED;
+    }
+#ifdef WINE_IOS
+    if (!ios_verify_file_mapping( host_addr, host_size, PROT_READ | PROT_WRITE, "fallback" ))
+    {
+        errno = EACCES;
+        return STATUS_ACCESS_DENIED;
+    }
+#endif
+
+    {
+        ssize_t got = pread( fd, map_addr, size, offset );
+        if (got < 0)
+        {
+            dprintf(2, "[vmem-denied] unaligned file fallback pread failed: addr=%p size=0x%lx off=0x%llx errno=%d (%s)\n",
+                    map_addr, (unsigned long)size, (unsigned long long)offset,
+                    errno, strerror(errno));
+            return STATUS_ACCESS_DENIED;
+        }
+        if ((size_t)got != size)
+        {
+            dprintf(2, "[vmem-denied] unaligned file fallback short read: addr=%p wanted=0x%lx got=0x%lx off=0x%llx\n",
+                    map_addr, (unsigned long)size, (unsigned long)got,
+                    (unsigned long long)offset);
+            return STATUS_PARTIAL_COPY;
+        }
+    }
     return STATUS_SUCCESS;
 }
 
@@ -10731,7 +10913,19 @@ static NTSTATUS map_pe_header( void *ptr, size_t size, size_t map_size, int fd, 
     {
         if (mmap( ptr, map_size, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE, fd, 0 ) != MAP_FAILED)
         {
-            if (size > map_size) pread( fd, (char *)ptr + map_size, size - map_size, map_size );
+#ifdef WINE_IOS
+            if (!ios_verify_file_mapping( ptr, map_size, PROT_READ | PROT_WRITE, "PE header" ))
+            {
+                munmap( ptr, map_size );
+                return STATUS_ACCESS_DENIED;
+            }
+#endif
+            if (size > map_size)
+            {
+                ssize_t got = pread( fd, (char *)ptr + map_size, size - map_size, map_size );
+                if (got < 0) return STATUS_ACCESS_DENIED;
+                if ((size_t)got != size - map_size) return STATUS_PARTIAL_COPY;
+            }
             return STATUS_SUCCESS;
         }
         switch (errno)
@@ -10750,7 +10944,11 @@ static NTSTATUS map_pe_header( void *ptr, size_t size, size_t map_size, int fd, 
         }
         *removable = TRUE;
     }
-    pread( fd, ptr, size, 0 );
+    {
+        ssize_t got = pread( fd, ptr, size, 0 );
+        if (got < 0) return STATUS_ACCESS_DENIED;
+        if ((size_t)got != size) return STATUS_PARTIAL_COPY;
+    }
     return STATUS_SUCCESS;  /* page protections will be updated later */
 }
 
