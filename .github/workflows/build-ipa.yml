@@ -528,7 +528,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build/dxmt-ios/shader-headers
-          key: shaders-b4b89f0-${{ env.CACHE_V }}
+          key: shaders-dd97225-${{ env.CACHE_V }}
 
       - name: Generate airconv shader headers
         if: steps.shaders.outputs.cache-hit != 'true'
@@ -566,7 +566,7 @@ jobs:
             build/dxmt-ios/obj
             app/Madeira/libdxmt_combined.a
             app/Madeira/aarch64-windows
-          key: dxmt-b4b89f0-${{ env.CACHE_V }}
+          key: dxmt-dd97225-${{ env.CACHE_V }}
 
       - name: DXMT
         if: steps.dxmt.outputs.cache-hit != 'true'

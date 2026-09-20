@@ -8,5 +8,5 @@
 	branch = ios-build
 [submodule "research/dxmt"]
 	path = research/dxmt
-	url = https://github.com/willfaust/dxmt.git
+	url = https://github.com/realdoomsboygaming/dxmt.git
 	branch = ios-port
