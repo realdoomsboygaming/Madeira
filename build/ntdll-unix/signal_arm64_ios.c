@@ -2973,7 +2973,64 @@ static void *ios_mach_exception_thread( void *arg )
                         *(uint16_t *)rw_addr = (uint16_t)IOS_STORE_SRC(rt);
                         emulated = 1;
                     }
-                    
+
+                    /* iOS-Madeira: STXR/STLXR stores into a protected JIT alias.
+                     *
+                     * The LDXR has already read from the RX view successfully;
+                     * only the conditional store faults because iOS refuses writes
+                     * through that view. The normal aligned-exclusive path cannot
+                     * be observed here (the load does not fault), so preserve the
+                     * JIT patching contract by committing the aligned store through
+                     * the RW alias and reporting success. This is intentionally
+                     * limited to an alias-backed write fault; misaligned guest
+                     * exclusives continue through the dedicated monitor path above.
+                     *
+                     * 0x880afd09 from the Shattered Pixel Dungeon run is
+                     *     STXR W10, W9, [X8]
+                     * and was previously left in [store-undecoded], causing the
+                     * same fault to be redelivered until the process died. */
+                    else if ((insn & 0x3FE0FC00u) == 0x0800FC00u || /* STLXR* */
+                             (insn & 0x3FE0FC00u) == 0x08007C00u)  /* STXR* */
+                    {
+                        const int size_lg2 = (insn >> 30) & 0x3;
+                        const size_t bytes = (size_t)1u << size_lg2;
+                        const int rs = (insn >> 16) & 0x1f; /* status/result W-register */
+                        const int rt = insn & 0x1f;         /* value source */
+
+                        /* The alias emulator must not synthesize an unaligned
+                         * exclusive: that would weaken the guest's atomicity. */
+                        if ((((uintptr_t)fault_addr | (uintptr_t)rw_addr) & (bytes - 1)) == 0)
+                        {
+                            uint64_t value = IOS_STORE_SRC(rt);
+                            switch (size_lg2)
+                            {
+                            case 0: __atomic_store_n((uint8_t  *)rw_addr, (uint8_t)value,  __ATOMIC_SEQ_CST); break;
+                            case 1: __atomic_store_n((uint16_t *)rw_addr, (uint16_t)value, __ATOMIC_SEQ_CST); break;
+                            case 2: __atomic_store_n((uint32_t *)rw_addr, (uint32_t)value, __ATOMIC_SEQ_CST); break;
+                            default: __atomic_store_n((uint64_t *)rw_addr, value, __ATOMIC_SEQ_CST); break;
+                            }
+
+                            /* STXR/STLXR always return status in a W-register;
+                             * zero means the alias-backed store completed. */
+                            if (rs != 31) state.__x[rs] = 0;
+                            __darwin_arm_thread_state64_set_pc_fptr(
+                                state, (void *)(uintptr_t)(fault_pc + 4));
+                            emulated = 1;
+
+                            {
+                                static int stxr_n;
+                                if (stxr_n < 8)
+                                    dprintf(STDERR_FILENO,
+                                        "[stxr-emul] #%d insn=0x%08x size=%zu Rs=w%d Rt=%s%d "
+                                        "addr=0x%llx rw=0x%llx status=0\n",
+                                        ++stxr_n, insn, bytes, rs,
+                                        rt == 31 ? "zr" : "w", rt,
+                                        (unsigned long long)fault_addr,
+                                        (unsigned long long)rw_addr);
+                            }
+                        }
+                    }
+
 
                     /* iOS-Madeira ml626: SWP{A}{L}{B,H} — ATOMIC SWAP.
                      *
