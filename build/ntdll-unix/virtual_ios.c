@@ -7455,7 +7455,8 @@ static void ios_share_probe(void)
  * jit26_detach on a scratch thread — worst case is a stuck background
  * thread, never a wedged boot. (ml81 lesson: CS_DEBUGGED is STICKY after
  * detach — that's why blessed JIT keeps working — so csops can't signal
- * detach; StikJITHelper.detachDebugger sets MADEIRA_DETACHED instead.
+ * detach. The MADEIRA_DETACHED marker is reserved for the iOS 26 BRK path;
+ * the iOS 16 attach/detach handshake does not need it.
  * Desktop sessions detach on session exit or the 20-min maxWait cap.) */
 static void *ios_share_probe_thread(void *arg)
 {
@@ -8043,6 +8044,12 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                                 base, (unsigned long)alloc_size, ex_rx, ex_rw, (int)pkr,
                                 cur_teb ? (unsigned)(ULONG_PTR)cur_teb->ClientId.UniqueThread : 0u,
                                 cur_teb ? (void *)cur_teb->Peb : NULL);
+                        if (pkr != KERN_SUCCESS)
+                        {
+                            dprintf(2, "[jit-prot] refusing existing alias %p after vm_protect failure kr=%d\n",
+                                    base, (int)pkr);
+                            return -1;
+                        }
                         return 0;
                     }
                 }
@@ -10443,7 +10450,10 @@ static void ios_dc_census_take( const void *addr, size_t len, struct ios_dc_cens
     }
 }
 
-static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size )
+/* Retained only as a reference for the pre-iOS-safe implementation.  The
+ * active implementation below preserves JIT aliases and validates every
+ * temporary protection transition before changing Wine's logical state. */
+static NTSTATUS __attribute__((unused)) decommit_pages_legacy( struct file_view *view, char *base, size_t size )
 {
     char *host_end, *host_start = (char *)ROUND_SIZE( 0, base, host_page_mask );
     /* ml293 probe state: which branch honoured the zero contract, and where to read back. */
@@ -10662,6 +10672,172 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
     return STATUS_SUCCESS;
 }
 
+
+/* iOS-Madeira: MEM_DECOMMIT must retain Linux/Wine's mapped-and-zeroed
+ * contract.  The old path used mmap-over and direct edge memset operations;
+ * on 16 KiB Mach pages that could either detach a user-VA JIT alias or touch a
+ * PROT_NONE edge while virtual_mutex was held.  Keep the physical JIT pool
+ * mappings intact, prepare only plain partial edge pages, and publish the
+ * logical decommit only after the physical work has succeeded. */
+#define IOS_DC_INLINE static inline __attribute__((always_inline))
+struct ios_dc_edge
+{
+    char *page, *base;
+    size_t size;
+    vm_prot_t original, maximum;
+    int changed;
+};
+
+IOS_DC_INLINE int ios_dc_query( char *page, vm_prot_t *current, vm_prot_t *maximum )
+{
+    mach_vm_address_t address = (mach_vm_address_t)(uintptr_t)page;
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    kern_return_t kr = mach_vm_region( mach_task_self(), &address, &size,
+                                       VM_REGION_BASIC_INFO_64,
+                                       (vm_region_info_t)&info, &count, &object );
+    if (object != MACH_PORT_NULL) mach_port_deallocate( mach_task_self(), object );
+    if (kr != KERN_SUCCESS || count != VM_REGION_BASIC_INFO_COUNT_64 ||
+        address > (uintptr_t)page || size < host_page_size ||
+        (uintptr_t)page - address > size - host_page_size) return 0;
+    *current = info.protection;
+    *maximum = info.max_protection;
+    return 1;
+}
+
+IOS_DC_INLINE int ios_dc_prepare( struct ios_dc_edge *edge, char *base, size_t size )
+{
+    vm_prot_t current, maximum;
+    uintptr_t overlap_base = 0, overlap_end = 0;
+    uintptr_t pool_rx = (uintptr_t)ios_jit_rx_base_global;
+    uintptr_t pool_rw = (uintptr_t)ios_jit_rw_base_global;
+    extern int ios_jit_anon_alias_overlaps( void *, size_t, uintptr_t *, uintptr_t * );
+
+    edge->page = ROUND_ADDR( base, host_page_mask );
+    edge->base = base;
+    edge->size = size;
+    edge->changed = 0;
+
+    /* Never make a plain partial-page route writable when it shares a host
+     * page with a user-VA alias or either physical pool view. */
+    if (ios_jit_anon_alias_overlaps( edge->page, host_page_size,
+                                     &overlap_base, &overlap_end )) return 0;
+    if (ios_jit_pool_size_global)
+    {
+        uintptr_t p = (uintptr_t)edge->page;
+        if ((pool_rx && ((p >= pool_rx && p - pool_rx < ios_jit_pool_size_global) ||
+                         (pool_rx >= p && pool_rx - p < host_page_size))) ||
+            (pool_rw && ((p >= pool_rw && p - pool_rw < ios_jit_pool_size_global) ||
+                         (pool_rw >= p && pool_rw - p < host_page_size)))) return 0;
+    }
+
+    if (!ios_dc_query( edge->page, &current, &maximum )) return 0;
+    edge->original = current;
+    edge->maximum = maximum;
+    if ((current & VM_PROT_EXECUTE) ||
+        (maximum & (VM_PROT_READ | VM_PROT_WRITE)) != (VM_PROT_READ | VM_PROT_WRITE)) return 0;
+    if ((current & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE)) return 1;
+
+    edge->changed = 1;
+    if (mach_vm_protect( mach_task_self(), (mach_vm_address_t)(uintptr_t)edge->page,
+                         host_page_size, FALSE,
+                         current | VM_PROT_READ | VM_PROT_WRITE ) != KERN_SUCCESS)
+        return 0;
+    if (!ios_dc_query( edge->page, &current, &maximum )) return 0;
+    return current == (edge->original | VM_PROT_READ | VM_PROT_WRITE) &&
+           maximum == edge->maximum;
+}
+
+IOS_DC_INLINE int ios_dc_restore( struct ios_dc_edge *edge )
+{
+    vm_prot_t current, maximum;
+    if (!edge->changed) return 1;
+    if (mach_vm_protect( mach_task_self(), (mach_vm_address_t)(uintptr_t)edge->page,
+                         host_page_size, FALSE, edge->original ) != KERN_SUCCESS)
+        return 0;
+    if (!ios_dc_query( edge->page, &current, &maximum )) return 0;
+    return current == edge->original && maximum == edge->maximum;
+}
+
+static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size )
+{
+    struct ios_dc_edge edges[2];
+    char *end, *host_start, *host_end;
+    unsigned count = 0, i;
+    NTSTATUS status = STATUS_ACCESS_DENIED;
+    uintptr_t rw_alias;
+    extern uintptr_t ios_jit_anon_alias_lookup( uintptr_t );
+
+    if (!size) size = view->size;
+    if (!size || (uintptr_t)base > ~(uintptr_t)0 - size ||
+        (uintptr_t)base > ~(uintptr_t)0 - host_page_mask)
+        return STATUS_ACCESS_DENIED;
+
+    end = base + size;
+    host_start = (char *)(((uintptr_t)base + host_page_mask) & ~(uintptr_t)host_page_mask);
+    host_end = ROUND_ADDR( end, host_page_mask );
+
+    /* A JIT alias is already backed by the shared pool.  Zero its RW view;
+     * never mmap-over the guest VA and silently detach the alias. */
+    rw_alias = ios_jit_anon_alias_lookup( (uintptr_t)base );
+    if (rw_alias)
+    {
+        size_t ledger_offset = 0;
+        void *ledger_peb = NULL;
+        if (!ios_pool_live_overlap( rw_alias, size, &ledger_offset, &ledger_peb ))
+            memset( (void *)rw_alias, 0, size );
+        else
+            dprintf(2, "[alias-tomb] STALE alias decommit REFUSED: user_va=%p size=0x%lx "
+                    "rw_alias=0x%lx -> pool off=0x%lx (LIVE, peb=%p)\n",
+                    base, (unsigned long)size, (unsigned long)rw_alias,
+                    (unsigned long)ledger_offset, ledger_peb);
+        goto success;
+    }
+
+    /* Prepare at most two partial host pages before touching the full-page
+     * interior.  This is required when a range begins and ends inside the
+     * same 16 KiB host page. */
+    if (base < host_start)
+    {
+        char *edge_end = end < host_start ? end : host_start;
+        if (!ios_dc_prepare( &edges[count++], base, edge_end - base )) goto cleanup;
+    }
+    if (host_end >= host_start && host_end < end)
+    {
+        if (!ios_dc_prepare( &edges[count++], host_end, end - host_end )) goto cleanup;
+    }
+
+    if (host_start < host_end &&
+        anon_mmap_fixed( host_start, host_end - host_start, PROT_READ | PROT_WRITE, 0 ) == MAP_FAILED)
+    {
+        status = STATUS_NO_MEMORY;
+        goto cleanup;
+    }
+
+    for (i = 0; i < count; ++i)
+    {
+        volatile const unsigned char *p = (const unsigned char *)edges[i].base;
+        size_t n;
+        memset( edges[i].base, 0, edges[i].size );
+        for (n = 0; n < edges[i].size; ++n)
+            if (p[n]) goto cleanup;
+    }
+    status = STATUS_SUCCESS;
+
+cleanup:
+    while (count)
+        if (!ios_dc_restore( &edges[--count] )) status = STATUS_ACCESS_DENIED;
+    if (status != STATUS_SUCCESS) return status;
+
+success:
+    set_page_vprot_bits( base, size, 0, VPROT_COMMITTED );
+    if (host_start < host_end)
+        kernel_writewatch_register_range( view, host_start, host_end - host_start );
+    return STATUS_SUCCESS;
+}
+#undef IOS_DC_INLINE
 
 /***********************************************************************
  *           remove_pages_from_view
@@ -11614,9 +11790,16 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         if (sec[i].Characteristics & IMAGE_SCN_MEM_WRITE)   vprot |= VPROT_WRITECOPY;
         if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) vprot |= VPROT_EXEC;
 
-        if (!set_vprot( view, ptr + sec[i].VirtualAddress, size, vprot ) && (vprot & VPROT_EXEC))
+        if (!set_vprot( view, ptr + sec[i].VirtualAddress, size, vprot ))
+        {
             ERR( "failed to set %08x protection on %s section %.8s, noexec filesystem?\n",
                  sec[i].Characteristics, debugstr_us(nt_name), sec[i].Name );
+            if (vprot & VPROT_EXEC)
+            {
+                status = STATUS_ACCESS_DENIED;
+                goto done;
+            }
+        }
     }
 
 #ifdef VALGRIND_LOAD_PDB_DEBUGINFO
@@ -11640,7 +11823,13 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         if (sec[si].Characteristics & IMAGE_SCN_MEM_WRITE) prot |= PROT_WRITE;
         ERR("iOS: eager JIT-copy section %.8s (addr=%p size=0x%lx)\n",
             sec[si].Name, sec_addr, (unsigned long)sec_size);
-        mprotect_exec(sec_addr, sec_size, prot);
+        if (mprotect_exec(sec_addr, sec_size, prot) < 0)
+        {
+            ERR("iOS: eager JIT-copy failed for section %.8s (addr=%p size=0x%lx)\n",
+                sec[si].Name, sec_addr, (unsigned long)sec_size);
+            status = STATUS_ACCESS_DENIED;
+            goto done;
+        }
     }
     /* iOS: data sections were mapped MAP_PRIVATE + PROT_READ|PROT_WRITE
      * (see map_file_into_view) so they're already mprotect-able. No
@@ -11886,7 +12075,13 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
                         if (s[i].Characteristics & IMAGE_SCN_MEM_WRITE) prot |= PROT_WRITE;
                         ERR("iOS: eager JIT-copy for builtin %s section (base=%p size=0x%lx)\n",
                             s[i].Name, sec_addr, (unsigned long)sec_size);
-                        mprotect_exec(sec_addr, sec_size, prot);
+                        if (mprotect_exec(sec_addr, sec_size, prot) < 0)
+                        {
+                            ERR("iOS: eager JIT-copy failed for builtin section (base=%p size=0x%lx)\n",
+                                sec_addr, (unsigned long)sec_size);
+                            status = STATUS_ACCESS_DENIED;
+                            goto done;
+                        }
                     }
                 }
             }

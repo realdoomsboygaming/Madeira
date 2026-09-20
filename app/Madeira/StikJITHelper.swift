@@ -82,13 +82,21 @@ enum StikJITHelper {
         }
     }
 
-    /// Poll every 0.5s until CS_DEBUGGED is set, then call completion.
+    /// Poll every 0.5s until CS_DEBUGGED is set, then call completion. A
+    /// timeout is required because UIApplication.open only confirms that a
+    /// URL handler accepted the request; it does not confirm that TrollStore
+    /// attached to this PID.
     private static func pollForJIT(completion: @escaping (Bool) -> Void) {
+        let deadline = Date().addingTimeInterval(20.0)
         Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { timer in
             if jit_check_debugged() {
                 timer.invalidate()
                 LogStore.shared.log("JIT enabled! (CS_DEBUGGED set)", level: .success)
                 completion(true)
+            } else if Date() >= deadline {
+                timer.invalidate()
+                LogStore.shared.log("JIT enable timed out: TrollStore did not set CS_DEBUGGED for this process", level: .error)
+                completion(false)
             }
         }
     }
@@ -354,10 +362,18 @@ enum StikJITHelper {
 
     /// Detach the debugger. Call this after Wine is done loading PE DLLs.
     static func detachDebugger() {
+        let backend = String(cString: jit_backend_name())
+        if backend == "ios16-legacy-dualmap" {
+            // TrollStore already performs the attach/detach handshake. There
+            // is no in-process detach protocol on iOS 16, and setting the
+            // modern MADEIRA_DETACHED flag here would make Wine believe the
+            // BRK debugger path had been explicitly shut down.
+            LogStore.shared.log("iOS 16 JIT authorization retained; no in-process debugger detach", level: .info)
+            return
+        }
         LogStore.shared.log("Detaching debugger...")
         jit_detach_debugger()
-        // task #34: signal in-process waiters (share-probe poller). CS_DEBUGGED
-        // is sticky post-detach, so an env flag is the reliable signal.
+        // Signal in-process waiters only after a real modern-protocol detach.
         setenv("MADEIRA_DETACHED", "1", 1)
         LogStore.shared.log("Debugger detached.", level: .success)
     }

@@ -894,7 +894,10 @@ struct ContentView: View {
     @StateObject private var logStore = LogStore.shared
     @State private var jitStatus: JITStatus = .unknown
     @State private var entitlements: EntitlementStatus?
-    @State private var debuggerAttached = isDebuggerAttached()
+    // JIT authorization is process state (CS_DEBUGGED), not the live
+    // debugger relationship (P_TRACED). TrollStore detaches after setting
+    // CS_DEBUGGED on iOS 16, so P_TRACED is expected to become false.
+    @State private var jitAuthorized = jit_check_debugged()
     @State private var showCustomExePicker = false
     @ObservedObject private var input = InputSettings.shared
     @State private var pointerPanel = false
@@ -1143,7 +1146,7 @@ struct ContentView: View {
         HStack(spacing: 8) {
             // Live debugger/JIT state, not the (macOS-only, never granted on
             // iOS) allow-jit entitlement the old badge checked.
-            entitlementBadge("JIT", granted: debuggerAttached)
+            entitlementBadge("JIT", granted: jitAuthorized)
             entitlementBadge("Memory+", granted: ents.increasedMemory)
             entitlementBadge("64-bit VA", granted: ents.extendedVA)
             Spacer()
@@ -1162,7 +1165,7 @@ struct ContentView: View {
         .padding(.top, 4)
         .padding(.bottom, 8)
         .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
-            debuggerAttached = isDebuggerAttached()
+            jitAuthorized = jit_check_debugged()
         }
     }
 

@@ -155,10 +155,10 @@ void winios_phase(const char *name)
  * #0xf00d protocol. The probe's healthy state did not exist, so it measured
  * nothing and could not have answered the question it was written for.
  *
- * CS_DEBUGGED is the flag StikDebug JIT actually rides on, it is what the
- * app's own green checkmark reads, and BOTH of its states are observable in
- * a normal run (set while attached, clear after detach) — so this probe can
- * be trusted when it says "no change", which is the whole point. */
+ * CS_DEBUGGED is the flag the debugger-backed JIT path rides on. It is
+ * intentionally separate from P_TRACED: TrollStore sets CS_DEBUGGED during
+ * its brief attach and then detaches, so an absent live debugger relationship
+ * must not be reported as lost JIT authorization. */
 static int winios_cs_debugged(void) {
     uint32_t flags = 0;
     if (csops(getpid(), CS_OPS_STATUS, &flags, sizeof(flags)) != 0) return -1;

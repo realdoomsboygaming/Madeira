@@ -45,10 +45,10 @@ struct EntitlementStatus {
     }
 }
 
-/* Runtime check: is a debugger attached to this process (P_TRACED)?
- * This is the signal the debugger-backed JIT path rides on — CS_DEBUGGED gets
- * set while traced, enabling JIT-region execution. On iOS 16 TrollStore needs
- * get-task-allow so its Enable JIT action can attach to this process. */
+/* Runtime check: is a debugger currently attached to this process (P_TRACED)?
+ * This is intentionally separate from JIT authorization. On iOS 16
+ * TrollStore attaches briefly to set CS_DEBUGGED and then detaches, so P_TRACED
+ * is expected to be false while the process remains JIT-authorized. */
 func isDebuggerAttached() -> Bool {
     var info = kinfo_proc()
     var size = MemoryLayout<kinfo_proc>.stride
