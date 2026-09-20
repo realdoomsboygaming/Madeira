@@ -664,8 +664,8 @@ jobs:
           grep -q "com.apple.developer.kernel.extended-virtual-addressing" /tmp/madeira-entitlements.plist
           grep -q "com.apple.developer.kernel.increased-memory-limit" /tmp/madeira-entitlements.plist
           (cd artifacts && zip -qry Madeira.ipa Payload)
-          unzip -l Madeira.ipa | grep -q "Payload/Madeira.app/Madeira"
-          ls -lh Madeira.ipa
+          unzip -l artifacts/Madeira.ipa | grep -q "Payload/Madeira.app/Madeira"
+          ls -lh artifacts/Madeira.ipa
 
       - name: Upload
         if: always()
