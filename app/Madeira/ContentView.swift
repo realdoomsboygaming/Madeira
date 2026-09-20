@@ -845,6 +845,51 @@ struct MadeiraMetalView: UIViewRepresentable {
     func updateUIView(_ uiView: MetalBackedView, context: Context) {}
 }
 
+/// UIDocumentPicker supports an initial directory on iOS 16, while SwiftUI's
+/// fileImporter modifier does not. This keeps selection inside the existing
+/// Wine C: drive; `asCopy: false` means the EXE is not imported or duplicated.
+struct WineExeDocumentPicker: UIViewControllerRepresentable {
+    let directoryURL: URL
+    let onPick: (URL) -> Void
+    let onCancel: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onPick: onPick, onCancel: onCancel)
+    }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(
+            forOpeningContentTypes: [.item],
+            asCopy: false
+        )
+        picker.allowsMultipleSelection = false
+        picker.directoryURL = directoryURL
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let onPick: (URL) -> Void
+        let onCancel: () -> Void
+
+        init(onPick: @escaping (URL) -> Void, onCancel: @escaping () -> Void) {
+            self.onPick = onPick
+            self.onCancel = onCancel
+        }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            guard let url = urls.first else { return }
+            onPick(url)
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            onCancel()
+        }
+    }
+}
+
 struct ContentView: View {
     @StateObject private var logStore = LogStore.shared
     @State private var jitStatus: JITStatus = .unknown
@@ -893,13 +938,21 @@ struct ContentView: View {
                 entitlements = EntitlementStatus.check()
                 logEntitlementStatus()
             }
-            .fileImporter(
-                isPresented: $showCustomExePicker,
-                initialDirectory: wineDriveURL,
-                allowedContentTypes: [.item],
-                allowsMultipleSelection: false
-            ) { result in
-                handleCustomExeSelection(result)
+            .sheet(isPresented: $showCustomExePicker) {
+                if let directoryURL = wineDriveURL {
+                    WineExeDocumentPicker(
+                        directoryURL: directoryURL,
+                        onPick: { selectedURL in
+                            showCustomExePicker = false
+                            handleCustomExeSelection(selectedURL)
+                        },
+                        onCancel: {
+                            showCustomExePicker = false
+                        }
+                    )
+                } else {
+                    Text("Wine C: drive is unavailable")
+                }
             }
         }
     }
@@ -1554,17 +1607,10 @@ struct ContentView: View {
 
     /// Select an EXE already inside the Wine C: drive. No copy is made: the
     /// selected sandbox URL is translated directly to its Wine C:\ path.
-    private func handleCustomExeSelection(_ result: Result<[URL], Error>) {
+    private func handleCustomExeSelection(_ selectedURL: URL) {
         let fm = FileManager.default
         guard let documents = fm.urls(for: .documentDirectory, in: .userDomainMask).first else {
             logStore.log("Could not locate the app Documents directory", level: .error)
-            return
-        }
-
-        guard case .success(let urls) = result, let selectedURL = urls.first else {
-            if case .failure(let error) = result {
-                logStore.log("EXE picker failed: \(error.localizedDescription)", level: .error)
-            }
             return
         }
 
