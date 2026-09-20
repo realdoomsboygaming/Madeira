@@ -74,10 +74,10 @@ static void fex_log(const char *fmt, ...) {
 
 // ---------------------------------------------------------------------------
 // JIT Memory Pool
-// Dual-mapped: RX pages (from debugger) + RW pages (via vm_remap)
+// Dual-mapped through JITAllocator. iOS16 uses the legacy debugger-enabled
+// anonymous backend; newer systems may select the isolated BRK backend.
 // ---------------------------------------------------------------------------
 static constexpr size_t JIT_POOL_SIZE = 64 * 1024 * 1024; // 64MB
-static constexpr size_t JIT_PAGE_SIZE = 0x4000; // 16KB iOS pages
 
 static void *g_jit_rx_base = nullptr;  // Executable view
 static void *g_jit_rw_base = nullptr;  // Writable view
@@ -91,12 +91,14 @@ static size_t align_up(size_t val, size_t align) {
 
 // Sub-allocate from the JIT pool. Returns RX pointer (canonical address).
 static void *jit_pool_alloc(size_t size) {
-    size = align_up(size, JIT_PAGE_SIZE);
-    size_t offset = g_jit_pool_offset.fetch_add(size, std::memory_order_relaxed);
-    if (offset + size > g_jit_pool_size) {
+    size = align_up(size, jit_page_size());
+    std::lock_guard<std::mutex> lock(g_jit_pool_mutex);
+    size_t offset = g_jit_pool_offset.load(std::memory_order_relaxed);
+    if (size > g_jit_pool_size - (offset <= g_jit_pool_size ? offset : g_jit_pool_size)) {
         fex_log("JIT pool exhausted: requested %zu at offset %zu (pool size %zu)", size, offset, g_jit_pool_size);
         return MAP_FAILED;
     }
+    g_jit_pool_offset.store(offset + size, std::memory_order_release);
     void *rx_ptr = static_cast<uint8_t*>(g_jit_rx_base) + offset;
     fex_log("JIT pool alloc: %zu bytes at RX=%p (offset %zu/%zu)", size, rx_ptr, offset + size, g_jit_pool_size);
     return rx_ptr;
@@ -110,7 +112,8 @@ static bool is_in_jit_pool(void *addr) {
     return a >= base && a < base + g_jit_pool_size;
 }
 
-// Initialize the JIT pool using Strategy 2 (debugger-allocated RX + vm_remap RW)
+// Initialize the JIT pool through the central backend so FEX and Wine use the
+// same W^X contract and the same cache-coherence rules.
 static bool jit_pool_init(void) {
     if (g_jit_rx_base) return true; // Already initialized
 
@@ -120,42 +123,14 @@ static bool jit_pool_init(void) {
     }
 
     size_t size = JIT_POOL_SIZE;
-    mach_port_t task = mach_task_self();
-
-    // Step 1: Ask debugger to allocate RX pages
-    fex_log("Requesting debugger to allocate %zu bytes of RX memory...", size);
-    void *rx_ptr = jit26_prepare_region(NULL, size);
-    if (!rx_ptr) {
-        fex_log("FAIL: Debugger RX allocation returned NULL");
+    size_t actual_size = 0;
+    if (!jit_pool_create(size, &g_jit_rx_base, &g_jit_rw_base, &actual_size)) {
+        fex_log("FAIL: JITAllocator backend=%s could not create FEX pool", jit_backend_name());
+        g_jit_rx_base = nullptr;
+        g_jit_rw_base = nullptr;
         return false;
     }
-    fex_log("Debugger allocated RX at %p", rx_ptr);
-
-    // Step 2: vm_remap to create RW view of the same pages
-    vm_address_t rw_addr = 0;
-    vm_prot_t cur_prot = 0, max_prot = 0;
-    kern_return_t kr = vm_remap(
-        task, &rw_addr, size, 0,
-        VM_FLAGS_ANYWHERE, task,
-        (vm_address_t)rx_ptr, FALSE,
-        &cur_prot, &max_prot, VM_INHERIT_NONE
-    );
-    if (kr != KERN_SUCCESS) {
-        fex_log("FAIL: vm_remap for RW mirror: %s (kr=%d)", mach_error_string(kr), kr);
-        return false;
-    }
-
-    // Step 3: Set the remapped view to RW
-    kr = vm_protect(task, rw_addr, size, FALSE, VM_PROT_READ | VM_PROT_WRITE);
-    if (kr != KERN_SUCCESS) {
-        fex_log("FAIL: vm_protect(RW): %s (kr=%d)", mach_error_string(kr), kr);
-        vm_deallocate(task, rw_addr, size);
-        return false;
-    }
-
-    g_jit_rx_base = rx_ptr;
-    g_jit_rw_base = reinterpret_cast<void*>(rw_addr);
-    g_jit_pool_size = size;
+    g_jit_pool_size = actual_size;
 
     int64_t write_offset = reinterpret_cast<intptr_t>(g_jit_rw_base) - reinterpret_cast<intptr_t>(g_jit_rx_base);
     FEXCore::DualMap::WriteOffset = write_offset;
@@ -167,12 +142,15 @@ static bool jit_pool_init(void) {
      * and did not reach Wine's GetEnvironmentVariableW. See
      * fex_get_jit_write_offset(). */
 
-    fex_log("JIT pool initialized: RX=%p, RW=%p, size=%zu, WriteOffset=%lld",
-            g_jit_rx_base, g_jit_rw_base, g_jit_pool_size, (long long)write_offset);
+    fex_log("JIT pool initialized: backend=%s RX=%p, RW=%p, size=%zu, WriteOffset=%lld",
+            jit_backend_name(), g_jit_rx_base, g_jit_rw_base, g_jit_pool_size,
+            (long long)write_offset);
 
     // Quick coherence test
     uint32_t test_val = 0xCAFEBABE;
     memcpy(g_jit_rw_base, &test_val, sizeof(test_val));
+    std::atomic_thread_fence(std::memory_order_release);
+    sys_icache_invalidate(g_jit_rx_base, sizeof(test_val));
     uint32_t readback = *static_cast<uint32_t*>(g_jit_rx_base);
     if (readback == test_val) {
         fex_log("Dual-map coherence OK");
@@ -681,8 +659,8 @@ int64_t fex_test_execute(void) {
     // On Linux this is done by LinuxEmulation/ThreadManager; on iOS we do it here.
     {
         constexpr size_t CALLRET_STACK_SIZE = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE; // 4MB
-        constexpr size_t PAGE_SIZE = 0x4000; // 16KB iOS pages
-        constexpr size_t ALLOC_SIZE = CALLRET_STACK_SIZE + 2 * PAGE_SIZE; // guard pages on both sides
+        const size_t PAGE_SIZE = jit_page_size();
+        const size_t ALLOC_SIZE = CALLRET_STACK_SIZE + 2 * PAGE_SIZE; // guard pages on both sides
 
         void *callret_alloc = ::mmap(nullptr, ALLOC_SIZE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (callret_alloc == MAP_FAILED) {

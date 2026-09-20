@@ -4774,6 +4774,33 @@ void *anon_mmap_fixed( void *start, size_t size, int prot, int flags )
     assert( !(size & host_page_mask) );
 
     ios_jit_range_tripwire( "anon_mmap_fixed", start, size, prot, __builtin_return_address(0) );
+
+#ifdef WINE_IOS
+    /* A PROT_NONE reservation is still a live Mach region.  Plain mmap()
+     * commonly gives that region max_protection=0 on iOS, so a later commit
+     * cannot raise it back to READ/WRITE and the Wine view is left logically
+     * committed but physically unreadable.  Map the guard with no current
+     * access but VM_PROT_ALL as its ceiling; vm_protect(...,TRUE,...) is not
+     * needed and this also preserves the MAP_FIXED replacement semantics used
+     * by unmap_area(). */
+    if (prot == PROT_NONE)
+    {
+        mach_vm_address_t address = (mach_vm_address_t)(uintptr_t)start;
+        kern_return_t kr = mach_vm_map( mach_task_self(), &address, size, 0,
+                                        VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                                        MEMORY_OBJECT_NULL, 0, 0, prot,
+                                        VM_PROT_ALL, VM_INHERIT_COPY );
+        if (kr != KERN_SUCCESS || address != (mach_vm_address_t)(uintptr_t)start)
+        {
+            errno = (kr == KERN_NO_SPACE ? EEXIST : ENOMEM);
+            dprintf(2, "[vmem-denied] iOS PROT_NONE reservation failed: addr=%p size=0x%lx kr=%d\n",
+                    start, (unsigned long)size, kr);
+            return MAP_FAILED;
+        }
+        return start;
+    }
+#endif
+
     return mmap( start, size, prot, MAP_PRIVATE | MAP_ANON | MAP_FIXED | flags, -1, 0 );
 }
 
@@ -7428,7 +7455,8 @@ static void ios_share_probe(void)
  * jit26_detach on a scratch thread — worst case is a stuck background
  * thread, never a wedged boot. (ml81 lesson: CS_DEBUGGED is STICKY after
  * detach — that's why blessed JIT keeps working — so csops can't signal
- * detach; StikJITHelper.detachDebugger sets MADEIRA_DETACHED instead.
+ * detach. The MADEIRA_DETACHED marker is reserved for the iOS 26 BRK path;
+ * the iOS 16 attach/detach handshake does not need it.
  * Desktop sessions detach on session exit or the 20-min maxWait cap.) */
 static void *ios_share_probe_thread(void *arg)
 {
@@ -7590,6 +7618,22 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 jit_rx_base = (void *)strtoull(rx_str, NULL, 16);
                 jit_rw_base = (void *)strtoull(rw_str, NULL, 16);
                 jit_pool_size = (size_t)strtoull(sz_str, NULL, 16);
+                if (!jit_rx_base || !jit_rw_base || jit_rx_base == jit_rw_base ||
+                    !jit_pool_size || (jit_pool_size & (host_page_size - 1)) ||
+                    ((uintptr_t)jit_rx_base & (host_page_size - 1)) ||
+                    ((uintptr_t)jit_rw_base & (host_page_size - 1)))
+                {
+                    ERR("iOS JIT: rejecting malformed pool geometry RX=%p RW=%p size=0x%lx page=0x%lx\n",
+                        jit_rx_base, jit_rw_base, (unsigned long)jit_pool_size,
+                        (unsigned long)host_page_size);
+                    jit_rx_base = jit_rw_base = NULL;
+                    jit_pool_size = 0;
+                }
+                if (!jit_rx_base || !jit_rw_base || !jit_pool_size)
+                {
+                    jit_pool_init_done = 1;
+                    return -1;
+                }
                 /* Export for SIGBUS handler */
                 ios_jit_rx_base_global = jit_rx_base;
                 ios_jit_rw_base_global = jit_rw_base;
@@ -7627,7 +7671,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     ios_jit_teb_trampoline = (char *)jit_rx_base + 8;
                     /* Page-align the offset so PE images stay page-aligned
                      * (mprotect requires page-aligned addresses). */
-                    jit_pool_offset = 0x4000;  /* one 16KB iOS page */
+                    jit_pool_offset = host_page_size;  /* one host VM page */
                     ERR("iOS JIT: TEB trampoline at %p (pool+8)\n", ios_jit_teb_trampoline);
                 }
 
@@ -7936,7 +7980,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                  * alias so the STR-fault emulator routes writes through the
                  * RW alias. FEX writes via user_VA fault → emulator routes;
                  * FEX executes via user_VA → R+X works. */
-                size_t page_size = 0x4000;
+                size_t page_size = host_page_size;
                 size_t alloc_size = (size + page_size - 1) & ~(page_size - 1);
 
                 /* iOS-Madeira ml625: NEVER RE-BACK A GUEST VA THAT IS ALREADY LIVE.
@@ -8000,6 +8044,12 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                                 base, (unsigned long)alloc_size, ex_rx, ex_rw, (int)pkr,
                                 cur_teb ? (unsigned)(ULONG_PTR)cur_teb->ClientId.UniqueThread : 0u,
                                 cur_teb ? (void *)cur_teb->Peb : NULL);
+                        if (pkr != KERN_SUCCESS)
+                        {
+                            dprintf(2, "[jit-prot] refusing existing alias %p after vm_protect failure kr=%d\n",
+                                    base, (int)pkr);
+                            return -1;
+                        }
                         return 0;
                     }
                 }
@@ -8024,6 +8074,27 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                                 ios_jit_anon_alias_hiwater);
                         mprotect( base, size, PROT_READ );
                         errno = ENOMEM;
+                        return -1;
+                    }
+                }
+
+                /* mprotect_exec reaches this anonymous-alias path while
+                 * virtual_mutex is held.  A fixed overwrite over a live image
+                 * or file view would replace Wine's mapping with an anonymous
+                 * JIT view, while the view tree and per-page vprot table still
+                 * describe the old object.  That is exactly the provenance
+                 * mismatch behind anonymous prot=0/max=0 pages reported inside
+                 * Wine image views.  Anonymous SEC_RESERVE/SEC_COMMIT views are
+                 * valid JIT targets; image/file views are not. */
+                {
+                    struct file_view *overlap = find_view_range( base, alloc_size );
+                    if (overlap && (overlap->protect & (SEC_IMAGE | SEC_FILE)))
+                    {
+                        dprintf(2, "[jit-remap-denied] refusing fixed overwrite %p+0x%lx over Wine view %p+0x%lx protect=0x%x\n",
+                                base, (unsigned long)alloc_size, overlap->base,
+                                (unsigned long)overlap->size, overlap->protect);
+                        mprotect( base, size, PROT_READ );
+                        errno = EEXIST;
                         return -1;
                     }
                 }
@@ -8105,7 +8176,8 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     ERR("iOS JIT: anon RWX vm_remap failed kr=%d %p+0x%lx\n",
                         kr, base, (unsigned long)alloc_size);
                     mprotect( base, size, PROT_READ );
-                    return 0;
+                    errno = EACCES;
+                    return -1;
                 }
 
                 /* iOS needs an explicit vm_protect to activate EXEC on the
@@ -8120,6 +8192,9 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     {
                         ERR("iOS JIT: anon RWX vm_protect(R+X) failed kr=%d %p+0x%lx\n",
                             pkr, base, (unsigned long)alloc_size);
+                        mprotect( base, size, PROT_READ );
+                        errno = EACCES;
+                        return -1;
                     }
                 }
 
@@ -9111,6 +9186,35 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
  */
 static BOOL set_vprot( struct file_view *view, void *base, size_t size, BYTE vprot )
 {
+    size_t first_page, last_page, page_count, i;
+    BYTE *old_vprot;
+    int host_status;
+
+    /* Keep the logical page table transactional with the host mapping.  The
+     * protection range may contain mixed 4-KB Wine pages inside one 16-KB iOS
+     * host page, and mprotect_range() can successfully process an initial run
+     * before failing on a later run.  Without a snapshot, a failed request
+     * leaves Wine reporting the new protection while Mach still has the old
+     * (or PROT_NONE) mapping. */
+    first_page = (size_t)base >> page_shift;
+    if ((size_t)base > (size_t)-1 - size - page_mask)
+    {
+        dprintf(2, "[vmem-denied] protection range overflow: base=%p size=0x%lx\n",
+                base, (unsigned long)size);
+        return FALSE;
+    }
+    last_page = ((size_t)base + size + page_mask) >> page_shift;
+    page_count = last_page - first_page;
+    if (page_count > (size_t)-1 / sizeof(*old_vprot) ||
+        !(old_vprot = malloc( page_count * sizeof(*old_vprot) )))
+    {
+        dprintf(2, "[vmem-denied] protection snapshot allocation failed: base=%p size=0x%lx pages=%lu\n",
+                base, (unsigned long)size, (unsigned long)page_count);
+        return FALSE;
+    }
+    for (i = 0; i < page_count; i++)
+        old_vprot[i] = get_page_vprot( (const void *)(uintptr_t)((first_page + i) << page_shift) );
+
     if (!use_kernel_writewatch && view->protect & VPROT_WRITEWATCH)
     {
         /* each page may need different protections depending on write watch flag */
@@ -9122,7 +9226,27 @@ static BOOL set_vprot( struct file_view *view, void *base, size_t size, BYTE vpr
         else if (use_kernel_writewatch && view->protect & VPROT_WRITEWATCH) vprot &= ~VPROT_WRITEWATCH;
         set_page_vprot( base, size, vprot );
     }
-    return !mprotect_range( base, size, 0, 0 );
+
+    host_status = mprotect_range( base, size, 0, 0 );
+    if (!host_status)
+    {
+        free( old_vprot );
+        return TRUE;
+    }
+
+    /* Restore the exact per-page logical state before trying to restore the
+     * corresponding host protection.  The second mprotect_range() is best
+     * effort: if the original mapping is already unrecoverable, the caller
+     * still receives failure instead of a false-success logical state. */
+    for (i = 0; i < page_count; i++)
+        set_page_vprot( (const void *)(uintptr_t)((first_page + i) << page_shift),
+                        page_size, old_vprot[i] );
+    free( old_vprot );
+
+    if (mprotect_range( base, size, 0, 0 ))
+        dprintf(2, "[vmem-denied] protection rollback host restore failed: base=%p size=0x%lx\n",
+                base, (unsigned long)size);
+    return FALSE;
 }
 
 
@@ -9829,6 +9953,42 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start
     return map_file_into_view_ex( view, fd, start, size, offset, vprot, removable, TRUE );
 }
 
+#ifdef WINE_IOS
+/* mmap() is not enough evidence on the legacy iOS path: a fixed mapping can
+ * report success while the resulting Mach region is still inaccessible (or
+ * has a zero protection ceiling).  Do not let the Wine view tree record a
+ * file-backed mapping until the kernel agrees with the requested protection. */
+static BOOL ios_verify_file_mapping( void *base, size_t size, int required,
+                                     const char *kind )
+{
+    mach_vm_address_t query = (mach_vm_address_t)(uintptr_t)base;
+    mach_vm_size_t region_size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object_name = MACH_PORT_NULL;
+    kern_return_t kr = mach_vm_region( mach_task_self(), &query, &region_size,
+                                       VM_REGION_BASIC_INFO_64,
+                                       (vm_region_info_t)&info, &info_count,
+                                       &object_name );
+    mach_vm_address_t end = (mach_vm_address_t)(uintptr_t)base + size;
+    mach_vm_address_t region_end = query + region_size;
+
+    if (kr != KERN_SUCCESS || query > (mach_vm_address_t)(uintptr_t)base ||
+        region_end < end || (info.protection & required) != required ||
+        (info.max_protection & required) != required)
+    {
+        dprintf( 2, "[vmem-denied] %s mapping verification failed: base=%p size=0x%lx "
+                 "kr=%d region=%p+0x%llx prot=0x%x max=0x%x required=0x%x\n",
+                 kind, base, (unsigned long)size, kr,
+                 (void *)(uintptr_t)query, (unsigned long long)region_size,
+                 kr == KERN_SUCCESS ? info.protection : 0,
+                 kr == KERN_SUCCESS ? info.max_protection : 0, required );
+        return FALSE;
+    }
+    return TRUE;
+}
+#endif
+
 /* ml561 (Sol's provenance recorder): remember HOW each file mapping was made.
  *
  * ml554 and ml559 both faulted at EXACTLY view_base+0x10000 — the 64KB Windows
@@ -10041,6 +10201,14 @@ static NTSTATUS map_file_into_view_ex( struct file_view *view, int fd, size_t st
         }
         if (mmap( host_addr, host_size, prot, flags, fd, offset ) != MAP_FAILED)
         {
+#ifdef WINE_IOS
+            if (!ios_verify_file_mapping( host_addr, host_size, prot, "file" ))
+            {
+                munmap( host_addr, host_size );
+                errno = EACCES;
+                return STATUS_ACCESS_DENIED;
+            }
+#endif
             ios_map_record( view->base, view->size, start, size, map_size, host_size,
                             fd, (long long)offset, (flags & MAP_SHARED) != 0, for_image );
             return STATUS_SUCCESS;
@@ -10080,8 +10248,45 @@ static NTSTATUS map_file_into_view_ex( struct file_view *view, int fd, size_t st
         return STATUS_INVALID_PARAMETER;
     }
 
-    mprotect( map_addr, map_size, PROT_READ | PROT_WRITE );
-    pread( fd, map_addr, size, offset );
+    /* The fallback is reached when the Wine page/file offset is not aligned
+     * enough for mmap().  On iOS the host page is 16 KB, so using the Wine
+     * page-aligned map_addr/map_size here can itself make mprotect fail with
+     * EINVAL.  Widen the temporary writable window to the host-page bounds,
+     * then refuse success if either operation failed.  Returning success while
+     * the reservation is still PROT_NONE leaves a committed Wine view whose
+     * Mach region reports prot=0/max=0 and causes a later, much less useful
+     * fault in Apple's memcpy/memmove path. */
+    if (mprotect( host_addr, host_size, PROT_READ | PROT_WRITE ))
+    {
+        dprintf(2, "[vmem-denied] unaligned file fallback mprotect failed: addr=%p size=0x%lx errno=%d (%s)\n",
+                host_addr, (unsigned long)host_size, errno, strerror(errno));
+        return STATUS_ACCESS_DENIED;
+    }
+#ifdef WINE_IOS
+    if (!ios_verify_file_mapping( host_addr, host_size, PROT_READ | PROT_WRITE, "fallback" ))
+    {
+        errno = EACCES;
+        return STATUS_ACCESS_DENIED;
+    }
+#endif
+
+    {
+        ssize_t got = pread( fd, map_addr, size, offset );
+        if (got < 0)
+        {
+            dprintf(2, "[vmem-denied] unaligned file fallback pread failed: addr=%p size=0x%lx off=0x%llx errno=%d (%s)\n",
+                    map_addr, (unsigned long)size, (unsigned long long)offset,
+                    errno, strerror(errno));
+            return STATUS_ACCESS_DENIED;
+        }
+        if ((size_t)got != size)
+        {
+            dprintf(2, "[vmem-denied] unaligned file fallback short read: addr=%p wanted=0x%lx got=0x%lx off=0x%llx\n",
+                    map_addr, (unsigned long)size, (unsigned long)got,
+                    (unsigned long long)offset);
+            return STATUS_PARTIAL_COPY;
+        }
+    }
     return STATUS_SUCCESS;
 }
 
@@ -10245,7 +10450,10 @@ static void ios_dc_census_take( const void *addr, size_t len, struct ios_dc_cens
     }
 }
 
-static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size )
+/* Retained only as a reference for the pre-iOS-safe implementation.  The
+ * active implementation below preserves JIT aliases and validates every
+ * temporary protection transition before changing Wine's logical state. */
+static NTSTATUS __attribute__((unused)) decommit_pages_legacy( struct file_view *view, char *base, size_t size )
 {
     char *host_end, *host_start = (char *)ROUND_SIZE( 0, base, host_page_mask );
     /* ml293 probe state: which branch honoured the zero contract, and where to read back. */
@@ -10464,6 +10672,172 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
     return STATUS_SUCCESS;
 }
 
+
+/* iOS-Madeira: MEM_DECOMMIT must retain Linux/Wine's mapped-and-zeroed
+ * contract.  The old path used mmap-over and direct edge memset operations;
+ * on 16 KiB Mach pages that could either detach a user-VA JIT alias or touch a
+ * PROT_NONE edge while virtual_mutex was held.  Keep the physical JIT pool
+ * mappings intact, prepare only plain partial edge pages, and publish the
+ * logical decommit only after the physical work has succeeded. */
+#define IOS_DC_INLINE static inline __attribute__((always_inline))
+struct ios_dc_edge
+{
+    char *page, *base;
+    size_t size;
+    vm_prot_t original, maximum;
+    int changed;
+};
+
+IOS_DC_INLINE int ios_dc_query( char *page, vm_prot_t *current, vm_prot_t *maximum )
+{
+    mach_vm_address_t address = (mach_vm_address_t)(uintptr_t)page;
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    kern_return_t kr = mach_vm_region( mach_task_self(), &address, &size,
+                                       VM_REGION_BASIC_INFO_64,
+                                       (vm_region_info_t)&info, &count, &object );
+    if (object != MACH_PORT_NULL) mach_port_deallocate( mach_task_self(), object );
+    if (kr != KERN_SUCCESS || count != VM_REGION_BASIC_INFO_COUNT_64 ||
+        address > (uintptr_t)page || size < host_page_size ||
+        (uintptr_t)page - address > size - host_page_size) return 0;
+    *current = info.protection;
+    *maximum = info.max_protection;
+    return 1;
+}
+
+IOS_DC_INLINE int ios_dc_prepare( struct ios_dc_edge *edge, char *base, size_t size )
+{
+    vm_prot_t current, maximum;
+    uintptr_t overlap_base = 0, overlap_end = 0;
+    uintptr_t pool_rx = (uintptr_t)ios_jit_rx_base_global;
+    uintptr_t pool_rw = (uintptr_t)ios_jit_rw_base_global;
+    extern int ios_jit_anon_alias_overlaps( void *, size_t, uintptr_t *, uintptr_t * );
+
+    edge->page = ROUND_ADDR( base, host_page_mask );
+    edge->base = base;
+    edge->size = size;
+    edge->changed = 0;
+
+    /* Never make a plain partial-page route writable when it shares a host
+     * page with a user-VA alias or either physical pool view. */
+    if (ios_jit_anon_alias_overlaps( edge->page, host_page_size,
+                                     &overlap_base, &overlap_end )) return 0;
+    if (ios_jit_pool_size_global)
+    {
+        uintptr_t p = (uintptr_t)edge->page;
+        if ((pool_rx && ((p >= pool_rx && p - pool_rx < ios_jit_pool_size_global) ||
+                         (pool_rx >= p && pool_rx - p < host_page_size))) ||
+            (pool_rw && ((p >= pool_rw && p - pool_rw < ios_jit_pool_size_global) ||
+                         (pool_rw >= p && pool_rw - p < host_page_size)))) return 0;
+    }
+
+    if (!ios_dc_query( edge->page, &current, &maximum )) return 0;
+    edge->original = current;
+    edge->maximum = maximum;
+    if ((current & VM_PROT_EXECUTE) ||
+        (maximum & (VM_PROT_READ | VM_PROT_WRITE)) != (VM_PROT_READ | VM_PROT_WRITE)) return 0;
+    if ((current & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE)) return 1;
+
+    edge->changed = 1;
+    if (mach_vm_protect( mach_task_self(), (mach_vm_address_t)(uintptr_t)edge->page,
+                         host_page_size, FALSE,
+                         current | VM_PROT_READ | VM_PROT_WRITE ) != KERN_SUCCESS)
+        return 0;
+    if (!ios_dc_query( edge->page, &current, &maximum )) return 0;
+    return current == (edge->original | VM_PROT_READ | VM_PROT_WRITE) &&
+           maximum == edge->maximum;
+}
+
+IOS_DC_INLINE int ios_dc_restore( struct ios_dc_edge *edge )
+{
+    vm_prot_t current, maximum;
+    if (!edge->changed) return 1;
+    if (mach_vm_protect( mach_task_self(), (mach_vm_address_t)(uintptr_t)edge->page,
+                         host_page_size, FALSE, edge->original ) != KERN_SUCCESS)
+        return 0;
+    if (!ios_dc_query( edge->page, &current, &maximum )) return 0;
+    return current == edge->original && maximum == edge->maximum;
+}
+
+static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size )
+{
+    struct ios_dc_edge edges[2];
+    char *end, *host_start, *host_end;
+    unsigned count = 0, i;
+    NTSTATUS status = STATUS_ACCESS_DENIED;
+    uintptr_t rw_alias;
+    extern uintptr_t ios_jit_anon_alias_lookup( uintptr_t );
+
+    if (!size) size = view->size;
+    if (!size || (uintptr_t)base > ~(uintptr_t)0 - size ||
+        (uintptr_t)base > ~(uintptr_t)0 - host_page_mask)
+        return STATUS_ACCESS_DENIED;
+
+    end = base + size;
+    host_start = (char *)(((uintptr_t)base + host_page_mask) & ~(uintptr_t)host_page_mask);
+    host_end = ROUND_ADDR( end, host_page_mask );
+
+    /* A JIT alias is already backed by the shared pool.  Zero its RW view;
+     * never mmap-over the guest VA and silently detach the alias. */
+    rw_alias = ios_jit_anon_alias_lookup( (uintptr_t)base );
+    if (rw_alias)
+    {
+        size_t ledger_offset = 0;
+        void *ledger_peb = NULL;
+        if (!ios_pool_live_overlap( rw_alias, size, &ledger_offset, &ledger_peb ))
+            memset( (void *)rw_alias, 0, size );
+        else
+            dprintf(2, "[alias-tomb] STALE alias decommit REFUSED: user_va=%p size=0x%lx "
+                    "rw_alias=0x%lx -> pool off=0x%lx (LIVE, peb=%p)\n",
+                    base, (unsigned long)size, (unsigned long)rw_alias,
+                    (unsigned long)ledger_offset, ledger_peb);
+        goto success;
+    }
+
+    /* Prepare at most two partial host pages before touching the full-page
+     * interior.  This is required when a range begins and ends inside the
+     * same 16 KiB host page. */
+    if (base < host_start)
+    {
+        char *edge_end = end < host_start ? end : host_start;
+        if (!ios_dc_prepare( &edges[count++], base, edge_end - base )) goto cleanup;
+    }
+    if (host_end >= host_start && host_end < end)
+    {
+        if (!ios_dc_prepare( &edges[count++], host_end, end - host_end )) goto cleanup;
+    }
+
+    if (host_start < host_end &&
+        anon_mmap_fixed( host_start, host_end - host_start, PROT_READ | PROT_WRITE, 0 ) == MAP_FAILED)
+    {
+        status = STATUS_NO_MEMORY;
+        goto cleanup;
+    }
+
+    for (i = 0; i < count; ++i)
+    {
+        volatile const unsigned char *p = (const unsigned char *)edges[i].base;
+        size_t n;
+        memset( edges[i].base, 0, edges[i].size );
+        for (n = 0; n < edges[i].size; ++n)
+            if (p[n]) goto cleanup;
+    }
+    status = STATUS_SUCCESS;
+
+cleanup:
+    while (count)
+        if (!ios_dc_restore( &edges[--count] )) status = STATUS_ACCESS_DENIED;
+    if (status != STATUS_SUCCESS) return status;
+
+success:
+    set_page_vprot_bits( base, size, 0, VPROT_COMMITTED );
+    if (host_start < host_end)
+        kernel_writewatch_register_range( view, host_start, host_end - host_start );
+    return STATUS_SUCCESS;
+}
+#undef IOS_DC_INLINE
 
 /***********************************************************************
  *           remove_pages_from_view
@@ -10715,7 +11089,19 @@ static NTSTATUS map_pe_header( void *ptr, size_t size, size_t map_size, int fd, 
     {
         if (mmap( ptr, map_size, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE, fd, 0 ) != MAP_FAILED)
         {
-            if (size > map_size) pread( fd, (char *)ptr + map_size, size - map_size, map_size );
+#ifdef WINE_IOS
+            if (!ios_verify_file_mapping( ptr, map_size, PROT_READ | PROT_WRITE, "PE header" ))
+            {
+                munmap( ptr, map_size );
+                return STATUS_ACCESS_DENIED;
+            }
+#endif
+            if (size > map_size)
+            {
+                ssize_t got = pread( fd, (char *)ptr + map_size, size - map_size, map_size );
+                if (got < 0) return STATUS_ACCESS_DENIED;
+                if ((size_t)got != size - map_size) return STATUS_PARTIAL_COPY;
+            }
             return STATUS_SUCCESS;
         }
         switch (errno)
@@ -10734,7 +11120,11 @@ static NTSTATUS map_pe_header( void *ptr, size_t size, size_t map_size, int fd, 
         }
         *removable = TRUE;
     }
-    pread( fd, ptr, size, 0 );
+    {
+        ssize_t got = pread( fd, ptr, size, 0 );
+        if (got < 0) return STATUS_ACCESS_DENIED;
+        if ((size_t)got != size) return STATUS_PARTIAL_COPY;
+    }
     return STATUS_SUCCESS;  /* page protections will be updated later */
 }
 
@@ -11400,9 +11790,16 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         if (sec[i].Characteristics & IMAGE_SCN_MEM_WRITE)   vprot |= VPROT_WRITECOPY;
         if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) vprot |= VPROT_EXEC;
 
-        if (!set_vprot( view, ptr + sec[i].VirtualAddress, size, vprot ) && (vprot & VPROT_EXEC))
+        if (!set_vprot( view, ptr + sec[i].VirtualAddress, size, vprot ))
+        {
             ERR( "failed to set %08x protection on %s section %.8s, noexec filesystem?\n",
                  sec[i].Characteristics, debugstr_us(nt_name), sec[i].Name );
+            if (vprot & VPROT_EXEC)
+            {
+                status = STATUS_ACCESS_DENIED;
+                goto done;
+            }
+        }
     }
 
 #ifdef VALGRIND_LOAD_PDB_DEBUGINFO
@@ -11426,7 +11823,13 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         if (sec[si].Characteristics & IMAGE_SCN_MEM_WRITE) prot |= PROT_WRITE;
         ERR("iOS: eager JIT-copy section %.8s (addr=%p size=0x%lx)\n",
             sec[si].Name, sec_addr, (unsigned long)sec_size);
-        mprotect_exec(sec_addr, sec_size, prot);
+        if (mprotect_exec(sec_addr, sec_size, prot) < 0)
+        {
+            ERR("iOS: eager JIT-copy failed for section %.8s (addr=%p size=0x%lx)\n",
+                sec[si].Name, sec_addr, (unsigned long)sec_size);
+            status = STATUS_ACCESS_DENIED;
+            goto done;
+        }
     }
     /* iOS: data sections were mapped MAP_PRIVATE + PROT_READ|PROT_WRITE
      * (see map_file_into_view) so they're already mprotect-able. No
@@ -11672,7 +12075,13 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
                         if (s[i].Characteristics & IMAGE_SCN_MEM_WRITE) prot |= PROT_WRITE;
                         ERR("iOS: eager JIT-copy for builtin %s section (base=%p size=0x%lx)\n",
                             s[i].Name, sec_addr, (unsigned long)sec_size);
-                        mprotect_exec(sec_addr, sec_size, prot);
+                        if (mprotect_exec(sec_addr, sec_size, prot) < 0)
+                        {
+                            ERR("iOS: eager JIT-copy failed for builtin section (base=%p size=0x%lx)\n",
+                                sec_addr, (unsigned long)sec_size);
+                            status = STATUS_ACCESS_DENIED;
+                            goto done;
+                        }
                     }
                 }
             }
@@ -15073,16 +15482,17 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
      * alias at the same offset within the pool.
      *
      * Triggered by: NtAllocateVirtualMemoryEx with attrs containing
-     * MEM_EXTENDED_PARAMETER_EC_CODE (0x40) and prot=PAGE_EXECUTE_READWRITE,
+     * MEM_EXTENDED_PARAMETER_EC_CODE (0x40) and an executable protection.
      * caller-supplied address NULL (kernel-pick). */
     if (process == NtCurrentProcess() &&
         (attributes & 0x40 /* MEM_EXTENDED_PARAMETER_EC_CODE_FLAG */) &&
-        protect == PAGE_EXECUTE_READWRITE &&
+        (protect == PAGE_EXECUTE_READ || protect == PAGE_EXECUTE_READWRITE) &&
         *ret == NULL &&
         ios_jit_rx_base_global && ios_jit_rw_base_global &&
         ios_jit_pool_size_global)
     {
-        size_t alloc_size = (*size_ptr + 0x3FFF) & ~0x3FFFUL;
+        size_t page_size = host_page_size;
+        size_t alloc_size = (*size_ptr + page_size - 1) & ~(page_size - 1);
         /* ml459 (#75): cap a single EC code buffer at 16MB. FEX asks for 32MB
          * once its buffers get hot, but an old generation stays pinned by any
          * thread still referencing it (see [pool-tail] PIN) — and a 32MB

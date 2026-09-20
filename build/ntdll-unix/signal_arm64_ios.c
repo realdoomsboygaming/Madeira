@@ -2973,7 +2973,64 @@ static void *ios_mach_exception_thread( void *arg )
                         *(uint16_t *)rw_addr = (uint16_t)IOS_STORE_SRC(rt);
                         emulated = 1;
                     }
-                    
+
+                    /* iOS-Madeira: STXR/STLXR stores into a protected JIT alias.
+                     *
+                     * The LDXR has already read from the RX view successfully;
+                     * only the conditional store faults because iOS refuses writes
+                     * through that view. The normal aligned-exclusive path cannot
+                     * be observed here (the load does not fault), so preserve the
+                     * JIT patching contract by committing the aligned store through
+                     * the RW alias and reporting success. This is intentionally
+                     * limited to an alias-backed write fault; misaligned guest
+                     * exclusives continue through the dedicated monitor path above.
+                     *
+                     * 0x880afd09 from the Shattered Pixel Dungeon run is
+                     *     STXR W10, W9, [X8]
+                     * and was previously left in [store-undecoded], causing the
+                     * same fault to be redelivered until the process died. */
+                    else if ((insn & 0x3FE0FC00u) == 0x0800FC00u || /* STLXR* */
+                             (insn & 0x3FE0FC00u) == 0x08007C00u)  /* STXR* */
+                    {
+                        const int size_lg2 = (insn >> 30) & 0x3;
+                        const size_t bytes = (size_t)1u << size_lg2;
+                        const int rs = (insn >> 16) & 0x1f; /* status/result W-register */
+                        const int rt = insn & 0x1f;         /* value source */
+
+                        /* The alias emulator must not synthesize an unaligned
+                         * exclusive: that would weaken the guest's atomicity. */
+                        if ((((uintptr_t)fault_addr | (uintptr_t)rw_addr) & (bytes - 1)) == 0)
+                        {
+                            uint64_t value = IOS_STORE_SRC(rt);
+                            switch (size_lg2)
+                            {
+                            case 0: __atomic_store_n((uint8_t  *)rw_addr, (uint8_t)value,  __ATOMIC_SEQ_CST); break;
+                            case 1: __atomic_store_n((uint16_t *)rw_addr, (uint16_t)value, __ATOMIC_SEQ_CST); break;
+                            case 2: __atomic_store_n((uint32_t *)rw_addr, (uint32_t)value, __ATOMIC_SEQ_CST); break;
+                            default: __atomic_store_n((uint64_t *)rw_addr, value, __ATOMIC_SEQ_CST); break;
+                            }
+
+                            /* STXR/STLXR always return status in a W-register;
+                             * zero means the alias-backed store completed. */
+                            if (rs != 31) state.__x[rs] = 0;
+                            __darwin_arm_thread_state64_set_pc_fptr(
+                                state, (void *)(uintptr_t)(fault_pc + 4));
+                            emulated = 1;
+
+                            {
+                                static int stxr_n;
+                                if (stxr_n < 8)
+                                    dprintf(STDERR_FILENO,
+                                        "[stxr-emul] #%d insn=0x%08x size=%zu Rs=w%d Rt=%s%d "
+                                        "addr=0x%llx rw=0x%llx status=0\n",
+                                        ++stxr_n, insn, bytes, rs,
+                                        rt == 31 ? "zr" : "w", rt,
+                                        (unsigned long long)fault_addr,
+                                        (unsigned long long)rw_addr);
+                            }
+                        }
+                    }
+
 
                     /* iOS-Madeira ml626: SWP{A}{L}{B,H} — ATOMIC SWAP.
                      *
@@ -5186,9 +5243,14 @@ static void ios_install_task_exception_port(void)
      * jit26_prepare_region already ran (Swift side, pre-wine) so the pool is
      * unaffected; jit26_detach()'s BRK now lands in trap_handler's 0xf00d case
      * instead of the debugger, which is harmless. */
-    kr = task_swap_exception_ports( mach_task_self(),
-                                    EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION |
-                                    EXC_MASK_BREAKPOINT,
+    exception_mask_t task_mask = EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION;
+    /* iOS16 uses the legacy debugger-enabled dual-map and never emits the
+     * private BRK allocator protocol. Leave breakpoint delivery with an
+     * attached external debugger instead of claiming it here. */
+    if (getenv("MADEIRA_JIT_BACKEND") &&
+        !strcmp(getenv("MADEIRA_JIT_BACKEND"), "ios26-brk-dualmap"))
+        task_mask |= EXC_MASK_BREAKPOINT;
+    kr = task_swap_exception_ports( mach_task_self(), task_mask,
                                     ios_exc_port,
                                     (exception_behavior_t)(EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES),
                                     ARM_THREAD_STATE64,
@@ -5203,8 +5265,8 @@ static void ios_install_task_exception_port(void)
     /* Log what we displaced. A non-null previous port is the debugger's, and is
      * precisely the name that would have gone dead underneath us. Release the
      * send rights the swap handed us — we never send to them. */
-    ERR("[task-exc] INSTALLED ours=0x%x mask=ba+bi+brk displaced=%u rev=ml523\n",
-        ios_exc_port, (unsigned)old_count);
+    ERR("[task-exc] INSTALLED ours=0x%x mask=0x%x displaced=%u rev=ml523\n",
+        ios_exc_port, (unsigned)task_mask, (unsigned)old_count);
     for (i = 0; i < old_count; i++)
     {
         ERR("[task-exc]   prev[%u] mask=0x%x port=0x%x behavior=0x%x flavor=%d%s\n",
@@ -10882,7 +10944,8 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
         /* M8: Ask the debugger to write TEB data to page 0 via BRK #0xf00d cmd 3.
          * The debugger may have kernel privileges that the app doesn't.
          * Uses GDB M (memory write) command to write TEB data at address 0. */
-        if (!mapped) {
+        if (!mapped && getenv("MADEIRA_JIT_BACKEND") &&
+            !strcmp(getenv("MADEIRA_JIT_BACKEND"), "ios26-brk-dualmap")) {
             ERR("page0: trying debugger (BRK #0xf00d, x16=3)...\n");
             register uintptr_t x0_val __asm__("x0") = (uintptr_t)teb;
             register size_t x1_val __asm__("x1") = 0x4000;
