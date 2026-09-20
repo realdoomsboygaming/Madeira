@@ -1633,7 +1633,17 @@ struct ContentView: View {
         let relative = String(selectedPath.dropFirst(drivePath.count))
         let exe = "C:\\" + relative.replacingOccurrences(of: "/", with: "\\")
         setenv("MADEIRA_EXE", exe, 1)
-        unsetenv("MADEIRA_ARGS")
+        let argsFile = documents.appendingPathComponent("madeira-args.txt")
+        if let rawArgs = try? String(contentsOf: argsFile, encoding: .utf8) {
+            let args = rawArgs.trimmingCharacters(in: .whitespacesAndNewlines)
+            if args.isEmpty {
+                unsetenv("MADEIRA_ARGS")
+            } else {
+                setenv("MADEIRA_ARGS", args, 1)
+            }
+        } else {
+            unsetenv("MADEIRA_ARGS")
+        }
         unsetenv("MADEIRA_DESKTOP")
 
         logStore.log("Custom EXE: \(exe)", level: .success)
