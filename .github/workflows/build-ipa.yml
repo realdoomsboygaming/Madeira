@@ -267,7 +267,10 @@ jobs:
             build/win32u-unix/obj
             app/Madeira/libntdll_unix.a
             app/Madeira/libwin32u_unix.a
-          key: wineunix-7817e22-${{ env.CACHE_V }}
+          # The compile step is skipped on a cache hit. Include every patched
+          # unix-side source tree in the key so a source change cannot silently
+          # produce an IPA containing a stale libntdll_unix.a.
+          key: wineunix-7817e22-${{ env.CACHE_V }}-${{ hashFiles('build/ntdll-unix/**', 'build/win32u-unix/**', 'wine/dlls/ntdll/unix/**', 'wine/dlls/win32u/unix/**') }}
 
       - name: Wine unix libs (ntdll, win32u)
         if: steps.wineunix.outputs.cache-hit != 'true'
