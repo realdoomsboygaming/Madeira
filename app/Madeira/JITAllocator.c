@@ -104,6 +104,48 @@ static void log_kr(const char *operation, kern_return_t kr) {
     jit_log("%s: kr=%d (%s)", operation, kr, mach_error_string(kr));
 }
 
+/* vm_protect() can return success on some iOS 16 kernels while the requested
+ * permission is not present in the resulting Mach region.  Validate both
+ * aliases after every legacy dual-map transition so callers never proceed
+ * with a pool whose write path is only nominally writable. */
+static bool verify_region_protection(void *addr, size_t size,
+                                     vm_prot_t required_current,
+                                     vm_prot_t required_max,
+                                     const char *label) {
+    mach_vm_address_t query = (mach_vm_address_t)(uintptr_t)addr;
+    mach_vm_size_t region_size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object_name = MACH_PORT_NULL;
+    kern_return_t kr = mach_vm_region(mach_task_self(), &query, &region_size,
+                                      VM_REGION_BASIC_INFO_64,
+                                      (vm_region_info_t)&info, &info_count,
+                                      &object_name);
+    uintptr_t end = (uintptr_t)addr + size;
+    uintptr_t region_end = (uintptr_t)query + (uintptr_t)region_size;
+
+    if (kr != KERN_SUCCESS || query > (mach_vm_address_t)(uintptr_t)addr ||
+        region_end < end ||
+        (info.protection & required_current) != required_current ||
+        (info.max_protection & required_max) != required_max) {
+        jit_log("%s protection verification FAILED: addr=%p size=%zu kr=%d "
+                "region=%p+0x%llx current=0x%x max=0x%x required_current=0x%x "
+                "required_max=0x%x",
+                label, addr, size, kr, (void *)(uintptr_t)query,
+                (unsigned long long)region_size,
+                kr == KERN_SUCCESS ? info.protection : 0,
+                kr == KERN_SUCCESS ? info.max_protection : 0,
+                required_current, required_max);
+        return false;
+    }
+
+    jit_log("%s protection verified: region=%p+0x%llx current=0x%x max=0x%x",
+            label, (void *)(uintptr_t)query,
+            (unsigned long long)region_size, info.protection,
+            info.max_protection);
+    return true;
+}
+
 static int running_os_major(void) {
 #if __has_include(<sys/sysctl.h>)
     char version[64] = {0};
@@ -158,6 +200,19 @@ static bool legacy_dualmap_create(size_t size, void **rx_out, void **rw_out) {
                     VM_PROT_READ | VM_PROT_WRITE);
     if (kr != KERN_SUCCESS) {
         log_kr("legacy vm_protect(RW alias)", kr);
+        kern_return_t cleanup = vm_deallocate(task, rw_addr, size);
+        if (cleanup != KERN_SUCCESS) log_kr("legacy vm_deallocate(RW) cleanup", cleanup);
+        if (munmap(rx, size)) jit_log("legacy munmap(RX) cleanup failed: errno=%d", errno);
+        return false;
+    }
+
+    if (!verify_region_protection(rx, size, VM_PROT_READ | VM_PROT_EXECUTE,
+                                  VM_PROT_READ | VM_PROT_EXECUTE,
+                                  "legacy RX source") ||
+        !verify_region_protection((void *)rw_addr, size,
+                                  VM_PROT_READ | VM_PROT_WRITE,
+                                  VM_PROT_READ | VM_PROT_WRITE,
+                                  "legacy RW alias")) {
         kern_return_t cleanup = vm_deallocate(task, rw_addr, size);
         if (cleanup != KERN_SUCCESS) log_kr("legacy vm_deallocate(RW) cleanup", cleanup);
         if (munmap(rx, size)) jit_log("legacy munmap(RX) cleanup failed: errno=%d", errno);
