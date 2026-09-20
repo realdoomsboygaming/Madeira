@@ -363,7 +363,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: FEX/build-ios
-          key: fex-053c385-caspalstub-${{ env.CACHE_V }}
+          key: fex-0b7009f-ios16pmr-${{ env.CACHE_V }}
 
       # FEX fork bug: IosLogUnimplementedCASPAL (Arm64.cpp) sits OUTSIDE
       # every #ifdef FEX_IOS_HOST in that file, yet calls Win32 APIs —
