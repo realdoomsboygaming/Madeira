@@ -31,12 +31,14 @@ func checkAppEntitlement(_ ent: String) -> Bool {
 
 struct EntitlementStatus {
     let jitAllowed: Bool
+    let getTaskAllow: Bool
     let increasedMemory: Bool
     let extendedVA: Bool
 
     static func check() -> EntitlementStatus {
         EntitlementStatus(
             jitAllowed: checkAppEntitlement("com.apple.security.cs.allow-jit"),
+            getTaskAllow: checkAppEntitlement("get-task-allow"),
             increasedMemory: checkAppEntitlement("com.apple.developer.kernel.increased-memory-limit"),
             extendedVA: checkAppEntitlement("com.apple.developer.kernel.extended-virtual-addressing")
         )
@@ -44,10 +46,9 @@ struct EntitlementStatus {
 }
 
 /* Runtime check: is a debugger attached to this process (P_TRACED)?
- * This is the signal StikDebug JIT actually rides on — CS_DEBUGGED gets
- * set while traced, enabling JIT-region execution. The allow-jit
- * ENTITLEMENT is macOS-only and never granted on iOS, so the old badge
- * built on it was permanently ✗ no matter what StikDebug did. */
+ * This is the signal the debugger-backed JIT path rides on — CS_DEBUGGED gets
+ * set while traced, enabling JIT-region execution. On iOS 16 TrollStore needs
+ * get-task-allow so its Enable JIT action can attach to this process. */
 func isDebuggerAttached() -> Bool {
     var info = kinfo_proc()
     var size = MemoryLayout<kinfo_proc>.stride

@@ -1,8 +1,8 @@
 import UIKit
 
-/// Helper to enable JIT via StikDebug/StikJIT URL scheme.
-/// Opens StikDebug with an embedded script, polls for CS_DEBUGGED,
-/// then allocates JIT memory and detaches the debugger.
+/// Helper to enable JIT through the debugger-backed path supported by the
+/// installed package manager. iOS 16 uses TrollStore's apple-magnifier
+/// scheme; iOS 17.4+ uses StikDebug/StikJIT with the embedded script.
 enum StikJITHelper {
 
     /// The JIT script. Edit madeira-jit.js, then run:
@@ -21,19 +21,39 @@ enum StikJITHelper {
         return scriptBase64
     }
 
-    /// Check if StikDebug or StikJIT is available by trying to open their URL.
+    /// Check if the appropriate JIT helper is available.
     static var isAvailable: Bool {
-        guard #available(iOS 17.4, *) else { return false }
-        guard let url = URL(string: "stikjit://enable-jit") else { return false }
+        let scheme: String
+        if #available(iOS 17.4, *) {
+            scheme = "stikjit"
+        } else {
+            scheme = "apple-magnifier"
+        }
+        guard let url = URL(string: "\(scheme)://enable-jit") else { return false }
         return UIApplication.shared.canOpenURL(url)
     }
 
-    /// Open StikDebug with our JIT script embedded in the URL.
-    /// StikDebug will attach to our process and run the script.
+    /// Ask the installed JIT helper to attach to this process, then wait for
+    /// the kernel's CS_DEBUGGED bit before touching executable memory.
     static func enableJIT(completion: @escaping (Bool) -> Void) {
         guard #available(iOS 17.4, *) else {
-            LogStore.shared.log("iOS 16 legacy JIT path: attach an external development debugger, then Madeira will continue when CS_DEBUGGED is set.", level: .info)
-            pollForJIT(completion: completion)
+            let bundleId = Bundle.main.bundleIdentifier ?? "com.madeira.emulator"
+            guard let url = URL(string: "apple-magnifier://enable-jit?bundle-id=\(bundleId)") else {
+                LogStore.shared.log("Failed to build the TrollStore JIT URL", level: .error)
+                completion(false)
+                return
+            }
+
+            LogStore.shared.log("Opening TrollStore to enable JIT...")
+            UIApplication.shared.open(url, options: [:]) { success in
+                if !success {
+                    LogStore.shared.log("TrollStore did not handle Enable JIT. Install the TrollStore IPA and enable Developer Mode.", level: .error)
+                    completion(false)
+                    return
+                }
+                LogStore.shared.log("TrollStore JIT requested; waiting for CS_DEBUGGED...", level: .info)
+                pollForJIT(completion: completion)
+            }
             return
         }
         let bundleId = Bundle.main.bundleIdentifier ?? "com.madeira.emulator"

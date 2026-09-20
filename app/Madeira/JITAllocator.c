@@ -127,11 +127,11 @@ const char *jit_backend_name(void) {
 }
 
 /* iOS 16 backend: create the anonymous source mapping as RX, create a second
- * alias from that executable mapping, then lower the source view to RW. iOS
- * 16 accepts this debugger-backed transition, but rejects the inverse shape
- * (RW first, then adding X to the remapped alias) with
- * KERN_PROTECTION_FAILURE even while CS_DEBUGGED is set. There is never a
- * production RWX mapping and no private ledger flag is required. */
+ * alias from that executable mapping, then lower ONLY the alias to RW. This
+ * is the dual-map shape used by MeloNX and Dolphin: the original mapping
+ * remains executable and the remapped view is writable. Changing the RX
+ * source itself is rejected on some iOS 16 kernels with
+ * KERN_PROTECTION_FAILURE even while CS_DEBUGGED is set. */
 static bool legacy_dualmap_create(size_t size, void **rx_out, void **rw_out) {
     mach_port_t task = mach_task_self();
     void *rx = mmap(NULL, size, PROT_READ | PROT_EXEC,
@@ -154,20 +154,20 @@ static bool legacy_dualmap_create(size_t size, void **rx_out, void **rw_out) {
     jit_log("legacy vm_remap alias protections: current=0x%x max=0x%x",
             source_current, source_max);
 
-    kr = vm_protect(task, (vm_address_t)rx, size, FALSE,
+    kr = vm_protect(task, rw_addr, size, FALSE,
                     VM_PROT_READ | VM_PROT_WRITE);
     if (kr != KERN_SUCCESS) {
-        log_kr("legacy vm_protect(RW source)", kr);
+        log_kr("legacy vm_protect(RW alias)", kr);
         kern_return_t cleanup = vm_deallocate(task, rw_addr, size);
         if (cleanup != KERN_SUCCESS) log_kr("legacy vm_deallocate(RW) cleanup", cleanup);
         if (munmap(rx, size)) jit_log("legacy munmap(RX) cleanup failed: errno=%d", errno);
         return false;
     }
 
-    *rx_out = (void *)rw_addr;
-    *rw_out = rx;
+    *rx_out = rx;
+    *rw_out = (void *)rw_addr;
     jit_log("legacy dual-map ready: RW=%p RX=%p size=%zu page=%zu current={RW,RX}",
-            rx, (void *)rw_addr, size, jit_page_size());
+            (void *)rw_addr, rx, size, jit_page_size());
     return true;
 }
 

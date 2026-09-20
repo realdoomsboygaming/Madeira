@@ -45,7 +45,7 @@ jobs:
       - name: Host dependencies
         run: |
           set -euxo pipefail
-          brew install cmake ninja meson pkg-config bison flex sevenzip
+          brew install cmake ninja meson pkg-config bison flex sevenzip ldid
           echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
           echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
 
@@ -654,7 +654,16 @@ jobs:
           lipo -info out/Madeira.app/Madeira
           rm -rf artifacts && mkdir -p artifacts/Payload
           cp -R out/Madeira.app artifacts/Payload/Madeira.app
-          cd artifacts && zip -qry Madeira.ipa Payload
+          # The TrollStore IPA must be fakesigned with get-task-allow. An
+          # unsigned IPA can install, but TrollStore cannot attach its JIT
+          # debugger to it on iOS 16. Do not add dynamic-codesigning here:
+          # A12+ devices use ordinary per-launch TrollStore JIT instead.
+          ldid -S"$PWD/app/Madeira/Madeira-TrollStore.entitlements" artifacts/Payload/Madeira.app/Madeira
+          ldid -e artifacts/Payload/Madeira.app/Madeira | tee /tmp/madeira-entitlements.plist
+          grep -q "get-task-allow" /tmp/madeira-entitlements.plist
+          grep -q "com.apple.developer.kernel.extended-virtual-addressing" /tmp/madeira-entitlements.plist
+          grep -q "com.apple.developer.kernel.increased-memory-limit" /tmp/madeira-entitlements.plist
+          (cd artifacts && zip -qry Madeira.ipa Payload)
           unzip -l Madeira.ipa | grep -q "Payload/Madeira.app/Madeira"
           ls -lh Madeira.ipa
 

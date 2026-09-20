@@ -1133,6 +1133,10 @@ struct ContentView: View {
         if !ents.jitAllowed && legacyDebuggerJIT {
             logStore.log("  iOS 16 legacy JIT uses CS_DEBUGGED from the external debugger", level: .info)
         }
+        logStore.log("  get-task-allow: \(ents.getTaskAllow)", level: ents.getTaskAllow ? .success : .error)
+        if !ents.getTaskAllow && legacyDebuggerJIT {
+            logStore.log("  Install the TrollStore-fakesigned IPA; TrollStore needs get-task-allow for Enable JIT", level: .error)
+        }
         logStore.log("  increased-memory-limit: \(ents.increasedMemory)", level: ents.increasedMemory ? .success : .debug)
         logStore.log("  extended-virtual-addressing: \(ents.extendedVA)", level: ents.extendedVA ? .success : .debug)
         if !ents.extendedVA {
