@@ -14,7 +14,7 @@
       "iconURL": "",
       "tintColor": "7B68EE",
       "size": 0,
-      "minOSVersion": "17.0",
+      "minOSVersion": "16.0",
       "appPermissions": {
         "entitlements": [
           {

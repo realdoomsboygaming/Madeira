@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
+#include <stdatomic.h>
 #include <libkern/OSCacheControl.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -14,6 +16,9 @@
 #include <errno.h>
 #include <mach-o/dyld.h>
 #include <os/log.h>
+#if __has_include(<sys/sysctl.h>)
+#include <sys/sysctl.h>
+#endif
 
 // csops syscall - used to check CS_DEBUGGED flag
 #ifndef CS_DEBUGGED
@@ -34,12 +39,9 @@ extern kern_return_t mach_vm_region(vm_map_t, mach_vm_address_t *, mach_vm_size_
 extern kern_return_t mach_vm_protect(vm_map_t, mach_vm_address_t, mach_vm_size_t,
                                      boolean_t, vm_prot_t);
 
-// Page size on iOS is 16KB
-#define JIT_PAGE_SIZE 0x4000
-
-// VM_LEDGER_TAG_DEFAULT and VM_LEDGER_FLAG_NO_FOOTPRINT
-// These are private Mach APIs used by MeloNX to make JIT memory
-// not count against the app's Jetsam memory limit.
+// These private ledger APIs are retained only as an explicitly optional
+// diagnostic. They are not part of the iOS 16 allocation path: the kernel may
+// reject them, and a rejected exemption must never make allocation fail.
 #ifndef VM_LEDGER_TAG_DEFAULT
 #define VM_LEDGER_TAG_DEFAULT 0
 #endif
@@ -59,7 +61,6 @@ struct JITRegion {
     void *rw_ptr;       // Read-Write view (for writing code)
     void *rx_ptr;       // Read-Execute view (for executing code)
     size_t size;        // Size of the region
-    mach_port_t mem_entry;  // Memory entry port for cleanup
 };
 
 static jit_log_callback_t g_log_callback = NULL;
@@ -83,129 +84,190 @@ static void jit_log(const char *fmt, ...) {
     fprintf(stderr, "[JIT] %s\n", buf);
 }
 
+static size_t g_page_size;
+
+size_t jit_page_size(void) {
+    if (!g_page_size) {
+        long value = sysconf(_SC_PAGESIZE);
+        g_page_size = value > 0 ? (size_t)value : 4096;
+    }
+    return g_page_size;
+}
+
 static size_t align_to_page(size_t size) {
-    return (size + JIT_PAGE_SIZE - 1) & ~(JIT_PAGE_SIZE - 1);
+    size_t page = jit_page_size();
+    if (!size || size > SIZE_MAX - (page - 1)) return 0;
+    return (size + page - 1) & ~(page - 1);
+}
+
+static void log_kr(const char *operation, kern_return_t kr) {
+    jit_log("%s: kr=%d (%s)", operation, kr, mach_error_string(kr));
+}
+
+static int running_os_major(void) {
+#if __has_include(<sys/sysctl.h>)
+    char version[64] = {0};
+    size_t length = sizeof(version) - 1;
+    if (sysctlbyname("kern.osproductversion", version, &length, NULL, 0) == 0) {
+        return atoi(version);
+    }
+#endif
+    return 0;
+}
+
+static bool uses_ios26_brk_protocol(void) {
+    // The BRK/TXM protocol is intentionally isolated from the iOS 16 path.
+    // A failed version probe is treated as legacy rather than executing a
+    // private BRK on an older system.
+    return running_os_major() >= 26;
+}
+
+const char *jit_backend_name(void) {
+    return uses_ios26_brk_protocol() ? "ios26-brk-dualmap" : "ios16-legacy-dualmap";
+}
+
+/* iOS 16 backend: create anonymous RW storage, widen only its maximum
+ * protection while CS_DEBUGGED is active, then create a second alias and make
+ * the aliases disjoint in their current protections. There is never a
+ * production RWX mapping and no private ledger flag is required. */
+static bool legacy_dualmap_create(size_t size, void **rx_out, void **rw_out) {
+    mach_port_t task = mach_task_self();
+    void *rw = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (rw == MAP_FAILED) {
+        jit_log("legacy mmap(RW) failed: errno=%d", errno);
+        return false;
+    }
+
+    kern_return_t kr = vm_protect(task, (vm_address_t)rw, size, TRUE,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS) {
+        log_kr("legacy vm_protect(max=RWX)", kr);
+        int rc = munmap(rw, size);
+        if (rc) jit_log("legacy munmap(RW) cleanup failed: errno=%d", errno);
+        return false;
+    }
+
+    vm_address_t rx_addr = 0;
+    vm_prot_t source_current = 0, source_max = 0;
+    kr = vm_remap(task, &rx_addr, size, 0, VM_FLAGS_ANYWHERE, task,
+                  (vm_address_t)rw, FALSE, &source_current, &source_max,
+                  VM_INHERIT_NONE);
+    if (kr != KERN_SUCCESS) {
+        log_kr("legacy vm_remap(RX alias)", kr);
+        kr = vm_protect(task, (vm_address_t)rw, size, TRUE,
+                        VM_PROT_READ | VM_PROT_WRITE);
+        if (kr != KERN_SUCCESS) log_kr("legacy vm_protect(RW rollback)", kr);
+        if (munmap(rw, size)) jit_log("legacy munmap(RW) cleanup failed: errno=%d", errno);
+        return false;
+    }
+
+    kr = vm_protect(task, rx_addr, size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS) {
+        log_kr("legacy vm_protect(RX)", kr);
+        kern_return_t cleanup = vm_deallocate(task, rx_addr, size);
+        if (cleanup != KERN_SUCCESS) log_kr("legacy vm_deallocate(RX) cleanup", cleanup);
+        if (munmap(rw, size)) jit_log("legacy munmap(RW) cleanup failed: errno=%d", errno);
+        return false;
+    }
+
+    kr = vm_protect(task, (vm_address_t)rw, size, FALSE, VM_PROT_READ | VM_PROT_WRITE);
+    if (kr != KERN_SUCCESS) {
+        log_kr("legacy vm_protect(RW)", kr);
+        kern_return_t cleanup = vm_deallocate(task, rx_addr, size);
+        if (cleanup != KERN_SUCCESS) log_kr("legacy vm_deallocate(RX) cleanup", cleanup);
+        if (munmap(rw, size)) jit_log("legacy munmap(RW) cleanup failed: errno=%d", errno);
+        return false;
+    }
+
+    *rx_out = (void *)rx_addr;
+    *rw_out = rw;
+    jit_log("legacy dual-map ready: RW=%p RX=%p size=%zu page=%zu max=RWX current={RW,RX}",
+            rw, (void *)rx_addr, size, jit_page_size());
+    return true;
+}
+
+static bool modern_dualmap_create(size_t size, void **rx_out, void **rw_out) {
+    void *rx = jit26_prepare_region(NULL, size);
+    if (!rx) {
+        jit_log("iOS26 prepare_region returned NULL");
+        return false;
+    }
+
+    vm_address_t rw_addr = 0;
+    vm_prot_t current = 0, maximum = 0;
+    kern_return_t kr = vm_remap(mach_task_self(), &rw_addr, size, 0,
+                                VM_FLAGS_ANYWHERE, mach_task_self(),
+                                (vm_address_t)rx, FALSE, &current, &maximum,
+                                VM_INHERIT_NONE);
+    if (kr != KERN_SUCCESS) {
+        log_kr("iOS26 vm_remap(RW alias)", kr);
+        return false;
+    }
+    kr = vm_protect(mach_task_self(), rw_addr, size, FALSE,
+                    VM_PROT_READ | VM_PROT_WRITE);
+    if (kr != KERN_SUCCESS) {
+        log_kr("iOS26 vm_protect(RW)", kr);
+        kern_return_t cleanup = vm_deallocate(mach_task_self(), rw_addr, size);
+        if (cleanup != KERN_SUCCESS) log_kr("iOS26 vm_deallocate(RW) cleanup", cleanup);
+        return false;
+    }
+    *rx_out = rx;
+    *rw_out = (void *)rw_addr;
+    jit_log("iOS26 BRK dual-map ready: RW=%p RX=%p size=%zu current={RW,RX}",
+            *rw_out, *rx_out, size);
+    return true;
+}
+
+bool jit_pool_create(size_t requested, void **rx_ptr, void **rw_ptr, size_t *actual_size) {
+    if (!rx_ptr || !rw_ptr || !actual_size) return false;
+    *rx_ptr = NULL;
+    *rw_ptr = NULL;
+    *actual_size = 0;
+    size_t size = align_to_page(requested);
+    if (!size) {
+        jit_log("JIT pool request is empty or overflows page alignment: %zu", requested);
+        return false;
+    }
+    if (!jit_check_debugged()) {
+        jit_log("JIT pool refused: CS_DEBUGGED is not set (backend=%s)", jit_backend_name());
+        return false;
+    }
+
+    bool ok = uses_ios26_brk_protocol()
+        ? modern_dualmap_create(size, rx_ptr, rw_ptr)
+        : legacy_dualmap_create(size, rx_ptr, rw_ptr);
+    if (!ok) {
+        jit_log("JIT pool creation failed: backend=%s size=%zu", jit_backend_name(), size);
+        return false;
+    }
+    *actual_size = size;
+    return true;
+}
+
+void jit_pool_destroy(void *rx_ptr, void *rw_ptr, size_t size) {
+    if (rx_ptr) {
+        kern_return_t kr = vm_deallocate(mach_task_self(), (vm_address_t)rx_ptr, size);
+        if (kr != KERN_SUCCESS) log_kr("jit_pool_destroy(RX)", kr);
+    }
+    if (rw_ptr) {
+        kern_return_t kr = vm_deallocate(mach_task_self(), (vm_address_t)rw_ptr, size);
+        if (kr != KERN_SUCCESS) log_kr("jit_pool_destroy(RW)", kr);
+    }
 }
 
 JITRegion *jit_region_create(size_t size) {
-    size = align_to_page(size);
-
     JITRegion *region = calloc(1, sizeof(JITRegion));
     if (!region) {
         jit_log("Failed to allocate JITRegion struct");
         return NULL;
     }
-    region->size = size;
-    region->mem_entry = MACH_PORT_NULL;
-
-    kern_return_t kr;
-    mach_port_t task = mach_task_self();
-
-    // Strategy: MeloNX dual-mapping approach
-    //
-    // 1. Create a named memory entry with RWX max protection
-    // 2. Mark it as no-footprint (doesn't count against Jetsam limit)
-    // 3. Map two views of it:
-    //    - RW view for writing generated code
-    //    - RX view for executing generated code
-
-    // Step 1: Create a named memory entry
-    memory_object_size_t entry_size = (memory_object_size_t)size;
-    mach_port_t mem_entry = MACH_PORT_NULL;
-
-    kr = mach_make_memory_entry_64(
-        task,
-        &entry_size,
-        0,  // offset
-        MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE,
-        &mem_entry,
-        MACH_PORT_NULL  // parent entry
-    );
-
-    if (kr != KERN_SUCCESS) {
-        jit_log("mach_make_memory_entry_64 failed: %s (kr=%d)", mach_error_string(kr), kr);
+    if (!jit_pool_create(size, &region->rx_ptr, &region->rw_ptr, &region->size)) {
         free(region);
         return NULL;
     }
-
-    jit_log("Created memory entry: port=%d, size=%zu", mem_entry, (size_t)entry_size);
-    region->mem_entry = mem_entry;
-
-    // Step 2: Mark as no-footprint (MeloNX trick)
-    // This makes the memory not count against the app's Jetsam memory limit.
-    kr = mach_memory_entry_ownership(
-        mem_entry,
-        TASK_NULL,  // No owner task = system-owned
-        VM_LEDGER_TAG_DEFAULT,
-        VM_LEDGER_FLAG_NO_FOOTPRINT
-    );
-
-    if (kr != KERN_SUCCESS) {
-        // Non-fatal: memory will just count against the limit
-        jit_log("mach_memory_entry_ownership failed (non-fatal): %s (kr=%d)", mach_error_string(kr), kr);
-    } else {
-        jit_log("Memory entry marked as no-footprint");
-    }
-
-    // Step 3a: Map RW view (for writing code)
-    mach_vm_address_t rw_addr = 0;
-    kr = vm_map(
-        task,
-        (vm_address_t *)&rw_addr,
-        size,
-        0,  // mask
-        VM_FLAGS_ANYWHERE,
-        mem_entry,
-        0,  // offset
-        FALSE,  // copy
-        VM_PROT_READ | VM_PROT_WRITE,      // current protection
-        VM_PROT_READ | VM_PROT_WRITE,      // max protection
-        VM_INHERIT_DEFAULT
-    );
-
-    if (kr != KERN_SUCCESS) {
-        jit_log("vm_map (RW) failed: %s (kr=%d)", mach_error_string(kr), kr);
-        mach_port_deallocate(task, mem_entry);
-        free(region);
-        return NULL;
-    }
-
-    region->rw_ptr = (void *)rw_addr;
-    jit_log("Mapped RW view at %p", region->rw_ptr);
-
-    // Step 3b: Map RX view (for executing code)
-    mach_vm_address_t rx_addr = 0;
-    kr = vm_map(
-        task,
-        (vm_address_t *)&rx_addr,
-        size,
-        0,  // mask
-        VM_FLAGS_ANYWHERE,
-        mem_entry,
-        0,  // offset
-        FALSE,  // copy
-        VM_PROT_READ | VM_PROT_EXECUTE,                  // current protection
-        VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE,  // max protection
-        // Wider max so vm_protect can grant temporary W (e.g. FEX
-        // PatchCallChecker writes to its __ImageBase + RVA, which lands
-        // on the RX alias). vm_protect+VM_PROT_COPY then COW-flips the
-        // page R/W. W^X still enforced via the actual current protection.
-        VM_INHERIT_DEFAULT
-    );
-
-    if (kr != KERN_SUCCESS) {
-        jit_log("vm_map (RX) failed: %s (kr=%d)", mach_error_string(kr), kr);
-        // Clean up RW mapping
-        vm_deallocate(task, (vm_address_t)region->rw_ptr, size);
-        mach_port_deallocate(task, mem_entry);
-        free(region);
-        return NULL;
-    }
-
-    region->rx_ptr = (void *)rx_addr;
-    jit_log("Mapped RX view at %p", region->rx_ptr);
-    jit_log("Dual-mapped JIT region created: size=%zu, RW=%p, RX=%p", size, region->rw_ptr, region->rx_ptr);
-
+    jit_log("Dual-mapped JIT region created: size=%zu, RW=%p, RX=%p", region->size,
+            region->rw_ptr, region->rx_ptr);
     return region;
 }
 
@@ -314,21 +376,9 @@ bool jit_make_region_no_footprint(void *addr, size_t size, const char *label) {
 
 void jit_region_destroy(JITRegion *region) {
     if (!region) return;
-
-    mach_port_t task = mach_task_self();
-
-    if (region->rw_ptr) {
-        vm_deallocate(task, (vm_address_t)region->rw_ptr, region->size);
-        jit_log("Unmapped RW view at %p", region->rw_ptr);
-    }
-    if (region->rx_ptr) {
-        vm_deallocate(task, (vm_address_t)region->rx_ptr, region->size);
-        jit_log("Unmapped RX view at %p", region->rx_ptr);
-    }
-    if (region->mem_entry != MACH_PORT_NULL) {
-        mach_port_deallocate(task, region->mem_entry);
-    }
-
+    jit_pool_destroy(region->rx_ptr, region->rw_ptr, region->size);
+    jit_log("Destroyed dual-map: size=%zu RW=%p RX=%p", region->size,
+            region->rw_ptr, region->rx_ptr);
     free(region);
 }
 
@@ -345,22 +395,22 @@ size_t jit_region_size(JITRegion *region) {
 }
 
 void jit_region_invalidate(JITRegion *region, size_t offset, size_t size) {
-    if (!region || !region->rx_ptr) return;
+    if (!region || !region->rx_ptr || offset > region->size || size > region->size - offset) return;
     sys_icache_invalidate((char *)region->rx_ptr + offset, size);
 }
 
 void *jit_region_write(JITRegion *region, size_t offset, const void *code, size_t code_size) {
-    if (!region) return NULL;
-    if (offset + code_size > region->size) {
+    if (!region || !code || offset > region->size || code_size > region->size - offset) {
         jit_log("Write out of bounds: offset=%zu, code_size=%zu, region_size=%zu",
-                offset, code_size, region->size);
+                offset, code_size, region ? region->size : 0);
         return NULL;
     }
 
     // Write to the RW view
     memcpy((char *)region->rw_ptr + offset, code, code_size);
 
-    // Invalidate icache on the RX view
+    // Publish stores before invalidating the instruction cache on the RX view.
+    atomic_thread_fence(memory_order_release);
     sys_icache_invalidate((char *)region->rx_ptr + offset, code_size);
 
     // Return the RX pointer for execution
@@ -422,6 +472,18 @@ void jit26_detach(void) {
     );
 }
 
+void jit_detach_debugger(void) {
+    if (uses_ios26_brk_protocol()) {
+        jit_log("Detaching through the iOS26 BRK protocol");
+        jit26_detach();
+    } else {
+        // iOS16 has no public in-process detach operation. The debugger that
+        // set CS_DEBUGGED owns the session; the dual-map remains valid after
+        // the external debugger releases its task port.
+        jit_log("Legacy iOS16 backend: no BRK detach issued; retaining dual-map");
+    }
+}
+
 bool jit_check_debugged(void) {
     uint32_t flags = 0;
     int result = csops(getpid(), CS_OPS_STATUS, &flags, sizeof(flags));
@@ -438,7 +500,7 @@ bool jit_test_mapping(void) {
     jit_log("=== JIT Mapping Test (non-executing) ===");
 
     // Test 1: Can we create a dual-mapped region?
-    JITRegion *region = jit_region_create(JIT_PAGE_SIZE);
+    JITRegion *region = jit_region_create(jit_page_size());
     if (!region) {
         jit_log("FAIL: Could not create dual-mapped region");
         return false;
@@ -532,11 +594,12 @@ int64_t jit_test_execute(void) {
         0xD65F03C0,  // ret
     };
 
-    // Strategy 1: Dual-mapped region, write FIRST then prepare
-    // (TXM may authorize page content at preparation time)
-    jit_log("--- Strategy 1: Dual-map, write-then-prepare ---");
+    // Strategy 1: the legacy path is already authorized by CS_DEBUGGED. The
+    // iOS26 path additionally asks its debugger to prepare the RX pages.
+    jit_log("--- Strategy 1: %s ---", uses_ios26_brk_protocol()
+            ? "dual-map, write-then-prepare" : "legacy debugger-enabled dual-map");
     {
-        JITRegion *region = jit_region_create(JIT_PAGE_SIZE);
+        JITRegion *region = jit_region_create(jit_page_size());
         if (!region) {
             jit_log("FAIL: Could not create JIT region");
             return -1;
@@ -553,11 +616,14 @@ int64_t jit_test_execute(void) {
 
         jit_check_page_protection(region->rx_ptr, "RX page BEFORE prepare");
 
-        // NOW ask debugger to prepare (authorize) the pages
-        jit_log("Requesting debugger to prepare RX region at %p (%zu bytes)...",
-                region->rx_ptr, region->size);
-        void *prepared = jit26_prepare_region(region->rx_ptr, region->size);
-        jit_log("prepare_region returned: %p", prepared);
+        if (uses_ios26_brk_protocol()) {
+            jit_log("Requesting debugger to prepare RX region at %p (%zu bytes)...",
+                    region->rx_ptr, region->size);
+            void *prepared = jit26_prepare_region(region->rx_ptr, region->size);
+            jit_log("prepare_region returned: %p", prepared);
+        } else {
+            jit_log("Legacy iOS backend: RX authorization comes from CS_DEBUGGED");
+        }
 
         jit_check_page_protection(region->rx_ptr, "RX page AFTER prepare");
 
@@ -582,8 +648,8 @@ int64_t jit_test_execute(void) {
             };
             void *add_ptr = jit_region_write(region, sizeof(code), add_code, sizeof(add_code));
             if (add_ptr) {
-                // Re-prepare after writing new code
-                jit26_prepare_region(region->rx_ptr, region->size);
+                if (uses_ios26_brk_protocol())
+                    jit26_prepare_region(region->rx_ptr, region->size);
                 typedef int64_t (*add_func_t)(int64_t, int64_t);
                 int64_t add_result = ((add_func_t)add_ptr)(100, 200);
                 jit_log("add(100, 200) = %lld (expected 300)", add_result);
@@ -604,7 +670,7 @@ int64_t jit_test_execute(void) {
 }
 
 int64_t jit_test_execute_strategy2(void) {
-    jit_log("--- Strategy 2: Debugger-allocated RX + vm_remap RW (MeloNX approach) ---");
+    jit_log("--- Strategy 2: shared dual-map backend ---");
 
     if (!jit_check_debugged()) {
         jit_log("FAIL: CS_DEBUGGED not set. Attach debugger first.");
@@ -616,7 +682,26 @@ int64_t jit_test_execute_strategy2(void) {
         0xD65F03C0,  // ret
     };
 
-    size_t size = JIT_PAGE_SIZE;
+    // iOS16 has no BRK allocator. Re-run the same execution check through the
+    // legacy anonymous dual-map backend rather than ever issuing a modern
+    // protocol instruction on an older OS.
+    if (!uses_ios26_brk_protocol()) {
+        JITRegion *region = jit_region_create(jit_page_size());
+        if (!region) return -1;
+        void *entry = jit_region_write(region, 0, code, sizeof(code));
+        if (!entry) {
+            jit_region_destroy(region);
+            return -1;
+        }
+        jit_check_page_protection(region->rw_ptr, "legacy RW view");
+        jit_check_page_protection(region->rx_ptr, "legacy RX view");
+        int64_t result = ((int64_t (*)(void))entry)();
+        jit_log("Legacy strategy result: %lld (expected 42)", result);
+        jit_region_destroy(region);
+        return result == 42 ? 42 : result;
+    }
+
+    size_t size = jit_page_size();
     mach_port_t task = mach_task_self();
 
     // Step 1: Let StikDebug allocate RX pages via _M command (x0=0)
@@ -767,10 +852,10 @@ static void wxprobe_readback(const char *tag, void *addr, int rc, int err) {
 }
 
 void jit_wx_probe(void) {
-    const size_t len = JIT_PAGE_SIZE * 4;
+    const size_t len = jit_page_size() * 4;
 
     jit_log("[wx-probe] ml748 BEGIN  CS_DEBUGGED=%d pagesize=%d",
-            (int)jit_check_debugged(), (int)JIT_PAGE_SIZE);
+            (int)jit_check_debugged(), (int)jit_page_size());
 
     /* A file-backed PRIVATE mapping is the shape that actually fails: PE images
      * are mapped from the container, not allocated anonymously. Map our own

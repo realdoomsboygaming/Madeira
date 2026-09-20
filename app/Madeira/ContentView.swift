@@ -686,7 +686,7 @@ struct JoystickKeyView: View {
                             hosted = true
                         }
                     }
-                    .onChange(of: geo.frame(in: .global)) { _, f in
+                    .onChange(of: geo.frame(in: .global)) { f in
                         center = CGPoint(x: f.midX, y: f.midY)
                         JoystickPadState.shared.center = center
                     }
@@ -1720,7 +1720,7 @@ struct ContentView: View {
 
     private func enableJITViaStikDebug() {
         jitStatus = .testing
-        logStore.log("Requesting JIT via StikDebug URL scheme...")
+        logStore.log("Requesting debugger-backed JIT authorization...")
 
         StikJITHelper.enableJIT { success in
             if success {
@@ -1734,8 +1734,9 @@ struct ContentView: View {
     }
 
     /// Full sequence: allocate JIT pool, start wineserver, start Wine.
-    /// Debugger stays attached during PE loading so mprotect_exec can use BRK
-    /// to prepare code pages. Detach happens after Wine finishes + recovery.
+    /// The debugger remains attached while the legacy iOS16 pool is created and
+    /// while PE pages are copied into its RX alias. On iOS26 the same sequence
+    /// additionally uses the BRK preparation protocol.
     private func runWineFullSequence() {
         guard jit_check_debugged() else {
             logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
@@ -1760,14 +1761,16 @@ struct ContentView: View {
         ws_log_quiet = 1
 
         DispatchQueue.global(qos: .userInitiated).async {
-            // Step 1: Allocate JIT pool (BRK suspends entire process)
+            // Step 1: Allocate the dual-mapped JIT pool. Only the iOS26 backend
+            // uses BRK; iOS16 uses the debugger-enabled legacy Mach path.
             // 128 MB was enough for cube but Thumper exhausts it (more PE
             // copies + larger FEX block cache). Desktop mode holds the
             // session's aarch64 image set AND every child's x64 set AND the
             // FEX code buffers in ONE pool: Thumper-under-desktop hit 199MB
             // of image copies alone (2026-07-06), leaving the FEX tail carve
             // colliding with the head. 384 MB fits both plus slack; the pool
-            // is dual-map + NO_FOOTPRINT so unwritten pages cost nothing.
+            // is dual-map; the pool size still counts toward the device's
+            // memory budget, so keep the proven default and allow an override.
             //
             // 2026-07-10 (Steam S3): 384 MB is VIRTUAL-exhausted by Steam's
             // pseudo-process fan-out — steam.exe + services + rpcss + cmd +
@@ -1775,8 +1778,9 @@ struct ContentView: View {
             // (owner-keyed, no .text sharing yet) → 138 image copies hit
             // ~365 MB and the crash reporter's ntdll can't fit → the load
             // fails and execution BUS-faults on the un-committed image. Since
-            // the pool is jetsam-exempt + demand-committed (unwritten pages
-            // cost nothing), raising the VIRTUAL cap is a cheap, safe unblock.
+            // the pool is demand-committed, but its resident pages still count
+            // toward the device's memory budget; raising the VIRTUAL cap is a
+            // deliberate, bounded tradeoff.
             // 640 MB clears the current fan-out with headroom to reach the
             // ole32 delay-load (FEX riprel probe) and beyond. The real fix for
             // the PHYSICAL duplication is .text sharing (deferred project).
@@ -1785,9 +1789,9 @@ struct ContentView: View {
             // pool copy EXHAUSTED 640 (bump 412MB + no contiguous 212MB →
             // libcef load degraded → init CHECK). Pure-x64 skip-copy was
             // trialed and reverted (broke x18-trampoline layout, ml68);
-            // until skip-copy or .text sharing lands, buy headroom. Virtual
-            // is jetsam-exempt; the copy itself is ~212MB real RSS when
-            // written.
+            // until skip-copy or .text sharing lands, buy headroom. The pool
+            // remains subject to the device memory budget; the copy itself is
+            // ~212MB real RSS when written.
             // 2026-08-01 (ml364): 1152 MB — ml363 died at MSM depth on pool
             // EXHAUSTION (bump 858MB, freelist 0, tail-reserve 64MB) when
             // Chrome's in-proc GPU thread requested a doubled 32MB EC code
@@ -1991,12 +1995,12 @@ struct ContentView: View {
             }
 
             winios_phase("pool-alloc-begin")
-            logStore.log("Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...")
+            logStore.log("Allocating \(poolSizeMB)MB JIT pool via \(String(cString: jit_backend_name()))...")
             let t0 = CFAbsoluteTimeGetCurrent()
             let pool = StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)
             let elapsed = CFAbsoluteTimeGetCurrent() - t0
             winios_phase("pool-ready")
-            logStore.log("BRK suspension lasted \(String(format: "%.2f", elapsed))s")
+            logStore.log("JIT pool allocation took \(String(format: "%.2f", elapsed))s")
 
             // ml762: remote Metal backend. Documents/madeira-remote.txt holds
             // "<host-ip> <token>" and routes winemetal to a Metal daemon on that
@@ -2092,6 +2096,7 @@ struct ContentView: View {
 
             if let pool = pool {
                 logStore.log("JIT pool: RX=\(String(format: "%p", Int(bitPattern: pool.rx))), RW=\(String(format: "%p", Int(bitPattern: pool.rw))), size=\(pool.size / 1024 / 1024)MB", level: .success)
+                setenv("MADEIRA_JIT_BACKEND", jit_backend_name(), 1)
                 setenv("WINE_IOS_JIT_RX", String(format: "%lx", Int(bitPattern: pool.rx)), 1)
                 setenv("WINE_IOS_JIT_RW", String(format: "%lx", Int(bitPattern: pool.rw)), 1)
                 setenv("WINE_IOS_JIT_SIZE", String(format: "%lx", pool.size), 1)
@@ -2102,10 +2107,8 @@ struct ContentView: View {
                 // wrong conclusion I wrote into the source. A run without the pool can
                 // only manufacture misleading secondary crashes, so refuse to start one.
                 logStore.log("JIT pool allocation FAILED — not starting Wine.", level: .error)
-                logStore.log("  All placements landed in the forbidden guest 64G window.", level: .info)
-                logStore.log("  Force-quit and relaunch: placement is chosen by the kernel", level: .info)
-                logStore.log("  and depends on current memory layout, so a fresh process", level: .info)
-                logStore.log("  usually lands somewhere valid.", level: .info)
+                logStore.log("  The selected dual-map backend rejected the pool geometry or protection request.", level: .info)
+                logStore.log("  Force-quit and relaunch after checking the external debugger state.", level: .info)
                 logStore.uiPaused = false
                 return
             }
@@ -2134,8 +2137,9 @@ struct ContentView: View {
             // virtual_ios.c copies every PE .text into it rather than mprotecting,
             // because iOS/TXM blocks mprotect(PROT_EXEC) outright.
             //
-            // ORDERING MATTERS: our task-port claim installs at wine's first thread
-            // setup, which is AFTER this point, so this BRK still reaches StikDebug.
+            // ORDERING MATTERS on iOS26: our task-port claim installs at Wine's
+            // first thread setup, which is AFTER this point, so that BRK still
+            // reaches StikDebug. The iOS16 backend has no in-process BRK here.
             // Flip to false to A/B against the old attached-for-the-whole-run behaviour.
             let earlyDetach = true
             if earlyDetach, pool != nil {
@@ -2154,7 +2158,8 @@ struct ContentView: View {
             self.startWineserver()
             winios_phase("wineserver-up")
 
-            // Step 3: Start Wine (debugger still attached for PE loading BRK calls)
+            // Step 3: Start Wine. On iOS16 the already-created RX alias remains
+            // valid; on iOS26 the debugger may still service PE BRK calls.
             Thread.sleep(forTimeInterval: 2.0)
             winios_phase("wine-start")
             self.startWineProcess()
@@ -2163,8 +2168,8 @@ struct ContentView: View {
             // Poll wine_process_is_running() — it clears when __wine_main returns
             // For real games this never returns (message loop runs forever), so
             // the cap is what matters. After detach, the dual-mapped JIT pool
-            // keeps existing blocks executable; only NEW BRK-based compiles
-            // fail.
+            // keeps existing blocks executable. The iOS16 path has no BRK-based
+            // compile dependency; iOS26 may reject new protocol requests.
             //
             // 2026-05-13 first-frame: Thumper splash renders at ~50s but JIT is
             // STILL compiling new FMOD blocks 3M log lines later — audio init
@@ -2179,7 +2184,8 @@ struct ContentView: View {
             // the Mach emulator (no debugger), pool pages are pre-executable
             // (dual map), page0 runs once on the first thread, and a
             // post-detach compile was observed working (real_compiles
-            // 7093→7094, no faults). So: detach once the game is actually
+            // 7093→7094, no faults). On iOS16 detach is intentionally a no-op;
+            // on iOS26 detach once the game is actually
             // presenting (present #2 = first post-splash frame) plus a
             // settle window, instead of waiting out the full 1200s cap.
             let maxWait = 1200.0  // hard safety cap (unchanged)

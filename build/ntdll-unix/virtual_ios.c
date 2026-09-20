@@ -7590,6 +7590,22 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 jit_rx_base = (void *)strtoull(rx_str, NULL, 16);
                 jit_rw_base = (void *)strtoull(rw_str, NULL, 16);
                 jit_pool_size = (size_t)strtoull(sz_str, NULL, 16);
+                if (!jit_rx_base || !jit_rw_base || jit_rx_base == jit_rw_base ||
+                    !jit_pool_size || (jit_pool_size & (host_page_size - 1)) ||
+                    ((uintptr_t)jit_rx_base & (host_page_size - 1)) ||
+                    ((uintptr_t)jit_rw_base & (host_page_size - 1)))
+                {
+                    ERR("iOS JIT: rejecting malformed pool geometry RX=%p RW=%p size=0x%lx page=0x%lx\n",
+                        jit_rx_base, jit_rw_base, (unsigned long)jit_pool_size,
+                        (unsigned long)host_page_size);
+                    jit_rx_base = jit_rw_base = NULL;
+                    jit_pool_size = 0;
+                }
+                if (!jit_rx_base || !jit_rw_base || !jit_pool_size)
+                {
+                    jit_pool_init_done = 1;
+                    return -1;
+                }
                 /* Export for SIGBUS handler */
                 ios_jit_rx_base_global = jit_rx_base;
                 ios_jit_rw_base_global = jit_rw_base;
@@ -7627,7 +7643,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     ios_jit_teb_trampoline = (char *)jit_rx_base + 8;
                     /* Page-align the offset so PE images stay page-aligned
                      * (mprotect requires page-aligned addresses). */
-                    jit_pool_offset = 0x4000;  /* one 16KB iOS page */
+                    jit_pool_offset = host_page_size;  /* one host VM page */
                     ERR("iOS JIT: TEB trampoline at %p (pool+8)\n", ios_jit_teb_trampoline);
                 }
 
@@ -7936,7 +7952,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                  * alias so the STR-fault emulator routes writes through the
                  * RW alias. FEX writes via user_VA fault → emulator routes;
                  * FEX executes via user_VA → R+X works. */
-                size_t page_size = 0x4000;
+                size_t page_size = host_page_size;
                 size_t alloc_size = (size + page_size - 1) & ~(page_size - 1);
 
                 /* iOS-Madeira ml625: NEVER RE-BACK A GUEST VA THAT IS ALREADY LIVE.
@@ -15073,16 +15089,17 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
      * alias at the same offset within the pool.
      *
      * Triggered by: NtAllocateVirtualMemoryEx with attrs containing
-     * MEM_EXTENDED_PARAMETER_EC_CODE (0x40) and prot=PAGE_EXECUTE_READWRITE,
+     * MEM_EXTENDED_PARAMETER_EC_CODE (0x40) and an executable protection.
      * caller-supplied address NULL (kernel-pick). */
     if (process == NtCurrentProcess() &&
         (attributes & 0x40 /* MEM_EXTENDED_PARAMETER_EC_CODE_FLAG */) &&
-        protect == PAGE_EXECUTE_READWRITE &&
+        (protect == PAGE_EXECUTE_READ || protect == PAGE_EXECUTE_READWRITE) &&
         *ret == NULL &&
         ios_jit_rx_base_global && ios_jit_rw_base_global &&
         ios_jit_pool_size_global)
     {
-        size_t alloc_size = (*size_ptr + 0x3FFF) & ~0x3FFFUL;
+        size_t page_size = host_page_size;
+        size_t alloc_size = (*size_ptr + page_size - 1) & ~(page_size - 1);
         /* ml459 (#75): cap a single EC code buffer at 16MB. FEX asks for 32MB
          * once its buffers get hot, but an old generation stays pinned by any
          * thread still referencing it (see [pool-tail] PIN) — and a 32MB

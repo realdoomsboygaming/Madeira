@@ -19,13 +19,21 @@ typedef struct JITRegion JITRegion;
 //   - RX view: for executing generated code
 JITRegion *jit_region_create(size_t size);
 
+// Allocate/destroy a pool using the same backend as jit_region_create().
+// The returned views alias the same pages: RX is the execution address and
+// RW is the only address that may be written by code generation.
+bool jit_pool_create(size_t size, void **rx_ptr, void **rw_ptr, size_t *actual_size);
+void jit_pool_destroy(void *rx_ptr, void *rw_ptr, size_t size);
+
+// Human-readable backend and runtime page-size diagnostics.
+const char *jit_backend_name(void);
+size_t jit_page_size(void);
+
 // Destroy a JIT region and unmap both views.
 void jit_region_destroy(JITRegion *region);
 
-/// Mark an already-mapped range jetsam-exempt (VM_LEDGER_FLAG_NO_FOOTPRINT).
-/// For the production pool, whose pages come from the debugger rather than
-/// jit_region_create(). Logs phys_footprint either side; returns false and
-/// changes nothing if the private ownership API refuses.
+/// Optional diagnostic for the private VM ledger experiment. Production pool
+/// creation never depends on this call; a refusal is expected and non-fatal.
 bool jit_make_region_no_footprint(void *addr, size_t size, const char *label);
 
 // Get the RW (writable) pointer. Write generated code here.
@@ -60,6 +68,10 @@ void *jit26_prepare_region(void *addr, size_t len);
 
 // iOS 26 BRK-based protocol: Tell the debugger to detach.
 void jit26_detach(void);
+
+// Detach only when the running OS uses the iOS 26 BRK protocol. On iOS 16,
+// the legacy debugger-enabled dual-map path has no in-process detach syscall.
+void jit_detach_debugger(void);
 
 // Test if dual-mapped regions can be created and RX pages are viable,
 // WITHOUT actually executing generated code (safe to call without JIT).

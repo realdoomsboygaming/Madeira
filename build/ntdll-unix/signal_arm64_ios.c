@@ -5186,9 +5186,14 @@ static void ios_install_task_exception_port(void)
      * jit26_prepare_region already ran (Swift side, pre-wine) so the pool is
      * unaffected; jit26_detach()'s BRK now lands in trap_handler's 0xf00d case
      * instead of the debugger, which is harmless. */
-    kr = task_swap_exception_ports( mach_task_self(),
-                                    EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION |
-                                    EXC_MASK_BREAKPOINT,
+    exception_mask_t task_mask = EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION;
+    /* iOS16 uses the legacy debugger-enabled dual-map and never emits the
+     * private BRK allocator protocol. Leave breakpoint delivery with an
+     * attached external debugger instead of claiming it here. */
+    if (getenv("MADEIRA_JIT_BACKEND") &&
+        !strcmp(getenv("MADEIRA_JIT_BACKEND"), "ios26-brk-dualmap"))
+        task_mask |= EXC_MASK_BREAKPOINT;
+    kr = task_swap_exception_ports( mach_task_self(), task_mask,
                                     ios_exc_port,
                                     (exception_behavior_t)(EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES),
                                     ARM_THREAD_STATE64,
@@ -5203,8 +5208,8 @@ static void ios_install_task_exception_port(void)
     /* Log what we displaced. A non-null previous port is the debugger's, and is
      * precisely the name that would have gone dead underneath us. Release the
      * send rights the swap handed us — we never send to them. */
-    ERR("[task-exc] INSTALLED ours=0x%x mask=ba+bi+brk displaced=%u rev=ml523\n",
-        ios_exc_port, (unsigned)old_count);
+    ERR("[task-exc] INSTALLED ours=0x%x mask=0x%x displaced=%u rev=ml523\n",
+        ios_exc_port, (unsigned)task_mask, (unsigned)old_count);
     for (i = 0; i < old_count; i++)
     {
         ERR("[task-exc]   prev[%u] mask=0x%x port=0x%x behavior=0x%x flavor=%d%s\n",
@@ -10882,7 +10887,8 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
         /* M8: Ask the debugger to write TEB data to page 0 via BRK #0xf00d cmd 3.
          * The debugger may have kernel privileges that the app doesn't.
          * Uses GDB M (memory write) command to write TEB data at address 0. */
-        if (!mapped) {
+        if (!mapped && getenv("MADEIRA_JIT_BACKEND") &&
+            !strcmp(getenv("MADEIRA_JIT_BACKEND"), "ios26-brk-dualmap")) {
             ERR("page0: trying debugger (BRK #0xf00d, x16=3)...\n");
             register uintptr_t x0_val __asm__("x0") = (uintptr_t)teb;
             register size_t x1_val __asm__("x1") = 0x4000;
