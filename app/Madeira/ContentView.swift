@@ -1491,6 +1491,12 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.pink)
 
+                Button("Custom EXE") {
+                    runCustomExe()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.indigo)
+
                 Button("x64 DX11 cube") {
                     setenv("MADEIRA_EXE", "cube-x64.exe", 1)
                     unsetenv("MADEIRA_ARGS")
@@ -1529,6 +1535,62 @@ struct ContentView: View {
             }
             .padding()
         }
+    }
+
+    /// Launch the Windows executable named by Documents/madeira-exe.txt.
+    /// The file contains a Wine path such as:
+    ///   C:\Program Files\MyGame\MyGame.exe
+    /// Optional arguments are read from Documents/madeira-args.txt.
+    private func runCustomExe() {
+        let fm = FileManager.default
+        guard let documents = fm.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            logStore.log("Could not locate the app Documents directory", level: .error)
+            return
+        }
+
+        let exeFile = documents.appendingPathComponent("madeira-exe.txt")
+        guard let raw = try? String(contentsOf: exeFile, encoding: .utf8) else {
+            logStore.log("Create Documents/madeira-exe.txt with the Windows path to your EXE", level: .error)
+            logStore.log("Example: C:\\Program Files\\MyGame\\MyGame.exe", level: .info)
+            return
+        }
+
+        let exe = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "/", with: "\\")
+        guard exe.count > 3, exe.hasPrefix("C:\\") else {
+            logStore.log("Custom EXE must be a C:\\ path inside the Wine prefix", level: .error)
+            return
+        }
+
+        // Check the corresponding iOS sandbox path before starting the costly
+        // JIT/Wine sequence, so a typo does not look like a Wine crash.
+        let relative = String(exe.dropFirst(3)).replacingOccurrences(of: "\\", with: "/")
+        let hostExe = documents
+            .appendingPathComponent("wine/drive_c")
+            .appendingPathComponent(relative)
+            .standardizedFileURL
+        guard fm.fileExists(atPath: hostExe.path) else {
+            logStore.log("Custom EXE was not found in the Wine prefix", level: .error)
+            logStore.log("Expected: wine/drive_c/\(relative)", level: .info)
+            return
+        }
+
+        setenv("MADEIRA_EXE", exe, 1)
+        let argsFile = documents.appendingPathComponent("madeira-args.txt")
+        if let rawArgs = try? String(contentsOf: argsFile, encoding: .utf8) {
+            let args = rawArgs.trimmingCharacters(in: .whitespacesAndNewlines)
+            if args.isEmpty {
+                unsetenv("MADEIRA_ARGS")
+            } else {
+                setenv("MADEIRA_ARGS", args, 1)
+            }
+        } else {
+            unsetenv("MADEIRA_ARGS")
+        }
+        unsetenv("MADEIRA_DESKTOP")
+
+        logStore.log("Custom EXE: \(exe)", level: .success)
+        runWineFullSequence()
     }
 
     private func runTriangleTest() {
