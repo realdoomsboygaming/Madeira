@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 import UIKit
 import QuartzCore
 import Metal
@@ -849,6 +850,7 @@ struct ContentView: View {
     @State private var jitStatus: JITStatus = .unknown
     @State private var entitlements: EntitlementStatus?
     @State private var debuggerAttached = isDebuggerAttached()
+    @State private var showCustomExePicker = false
     @ObservedObject private var input = InputSettings.shared
     @State private var pointerPanel = false
     @Namespace private var pointerNS
@@ -890,6 +892,14 @@ struct ContentView: View {
                 jit_install_trap_handler()
                 entitlements = EntitlementStatus.check()
                 logEntitlementStatus()
+            }
+            .fileImporter(
+                isPresented: $showCustomExePicker,
+                initialDirectory: wineDriveURL,
+                allowedContentTypes: [.item],
+                allowsMultipleSelection: false
+            ) { result in
+                handleCustomExeSelection(result)
             }
         }
     }
@@ -1492,7 +1502,7 @@ struct ContentView: View {
                 .tint(.pink)
 
                 Button("Custom EXE") {
-                    runCustomExe()
+                    showCustomExePicker = true
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.indigo)
@@ -1537,56 +1547,47 @@ struct ContentView: View {
         }
     }
 
-    /// Launch the Windows executable named by Documents/madeira-exe.txt.
-    /// The file contains a Wine path such as:
-    ///   C:\Program Files\MyGame\MyGame.exe
-    /// Optional arguments are read from Documents/madeira-args.txt.
-    private func runCustomExe() {
+    private var wineDriveURL: URL? {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("wine/drive_c", isDirectory: true)
+    }
+
+    /// Select an EXE already inside the Wine C: drive. No copy is made: the
+    /// selected sandbox URL is translated directly to its Wine C:\ path.
+    private func handleCustomExeSelection(_ result: Result<[URL], Error>) {
         let fm = FileManager.default
         guard let documents = fm.urls(for: .documentDirectory, in: .userDomainMask).first else {
             logStore.log("Could not locate the app Documents directory", level: .error)
             return
         }
 
-        let exeFile = documents.appendingPathComponent("madeira-exe.txt")
-        guard let raw = try? String(contentsOf: exeFile, encoding: .utf8) else {
-            logStore.log("Create Documents/madeira-exe.txt with the Windows path to your EXE", level: .error)
-            logStore.log("Example: C:\\Program Files\\MyGame\\MyGame.exe", level: .info)
-            return
-        }
-
-        let exe = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "/", with: "\\")
-        guard exe.count > 3, exe.hasPrefix("C:\\") else {
-            logStore.log("Custom EXE must be a C:\\ path inside the Wine prefix", level: .error)
-            return
-        }
-
-        // Check the corresponding iOS sandbox path before starting the costly
-        // JIT/Wine sequence, so a typo does not look like a Wine crash.
-        let relative = String(exe.dropFirst(3)).replacingOccurrences(of: "\\", with: "/")
-        let hostExe = documents
-            .appendingPathComponent("wine/drive_c")
-            .appendingPathComponent(relative)
-            .standardizedFileURL
-        guard fm.fileExists(atPath: hostExe.path) else {
-            logStore.log("Custom EXE was not found in the Wine prefix", level: .error)
-            logStore.log("Expected: wine/drive_c/\(relative)", level: .info)
-            return
-        }
-
-        setenv("MADEIRA_EXE", exe, 1)
-        let argsFile = documents.appendingPathComponent("madeira-args.txt")
-        if let rawArgs = try? String(contentsOf: argsFile, encoding: .utf8) {
-            let args = rawArgs.trimmingCharacters(in: .whitespacesAndNewlines)
-            if args.isEmpty {
-                unsetenv("MADEIRA_ARGS")
-            } else {
-                setenv("MADEIRA_ARGS", args, 1)
+        guard case .success(let urls) = result, let selectedURL = urls.first else {
+            if case .failure(let error) = result {
+                logStore.log("EXE picker failed: \(error.localizedDescription)", level: .error)
             }
-        } else {
-            unsetenv("MADEIRA_ARGS")
+            return
         }
+
+        guard selectedURL.pathExtension.lowercased() == "exe" else {
+            logStore.log("Select a Windows .exe file", level: .error)
+            return
+        }
+
+        let driveURL = documents
+            .appendingPathComponent("wine/drive_c", isDirectory: true)
+            .standardizedFileURL
+        let selectedPath = selectedURL.standardizedFileURL.path
+        let drivePath = driveURL.path.hasSuffix("/") ? driveURL.path : driveURL.path + "/"
+        guard selectedPath.hasPrefix(drivePath), fm.fileExists(atPath: selectedPath) else {
+            logStore.log("Select an EXE inside the Wine C: drive", level: .error)
+            logStore.log("Start in Documents/wine/drive_c", level: .info)
+            return
+        }
+
+        let relative = String(selectedPath.dropFirst(drivePath.count))
+        let exe = "C:\\" + relative.replacingOccurrences(of: "/", with: "\\")
+        setenv("MADEIRA_EXE", exe, 1)
+        unsetenv("MADEIRA_ARGS")
         unsetenv("MADEIRA_DESKTOP")
 
         logStore.log("Custom EXE: \(exe)", level: .success)
