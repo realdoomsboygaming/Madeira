@@ -673,3 +673,15 @@ jobs:
             build/dxmt-ios/obj/*.err
           if-no-files-found: warn
           retention-days: 7
+
+      # Keep a clean, one-file artifact for installation. GitHub Actions still
+      # serves artifacts as a download archive, but this archive contains only
+      # Madeira.ipa instead of the diagnostic logs above.
+      - name: Upload IPA
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira.ipa
+          path: artifacts/Madeira.ipa
+          if-no-files-found: error
+          retention-days: 7
