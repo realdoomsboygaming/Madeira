@@ -175,7 +175,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: wine/build-macos
-          key: wine-7817e22-${{ env.CACHE_V }}
+          # Generated Wine headers/libs must follow both the Wine source and
+          # Madeira's custom wineserver build inputs.  A manual CACHE_V bump
+          # is still retained as a coarse invalidation switch, but source
+          # edits now invalidate this cache automatically.
+          key: wine-7817e22-${{ env.CACHE_V }}-${{ hashFiles('wine/**', 'build/wineserver/**') }}
 
       # NOTE: a plain `make` CANNOT succeed here. dlls/win32u/win32u.so is
       # the macOS HOST .so, and the fork's patched bitblt.c references
@@ -293,7 +297,7 @@ jobs:
           path: |
             build/wineserver/obj
             app/Madeira/libwineserver.a
-          key: wineserver-7817e22-${{ env.CACHE_V }}
+          key: wineserver-7817e22-${{ env.CACHE_V }}-${{ hashFiles('wine/server/**', 'build/wineserver/**') }}
 
       - name: Seed wineserver base archive
         if: steps.wsrv.outputs.cache-hit != 'true'
@@ -366,7 +370,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: FEX/build-ios
-          key: fex-0b7009f-ios16pmr-${{ env.CACHE_V }}
+          key: fex-0b7009f-ios16pmr-${{ env.CACHE_V }}-${{ hashFiles('FEX/**') }}
 
       # FEX fork bug: IosLogUnimplementedCASPAL (Arm64.cpp) sits OUTSIDE
       # every #ifdef FEX_IOS_HOST in that file, yet calls Win32 APIs —
@@ -569,7 +573,7 @@ jobs:
             build/dxmt-ios/obj
             app/Madeira/libdxmt_combined.a
             app/Madeira/aarch64-windows
-          key: dxmt-dd97225-${{ env.CACHE_V }}
+          key: dxmt-dd97225-${{ env.CACHE_V }}-${{ hashFiles('research/dxmt/**', 'build/dxmt-ios/**') }}
 
       - name: DXMT
         if: steps.dxmt.outputs.cache-hit != 'true'
