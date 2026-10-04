@@ -1176,7 +1176,18 @@ struct ContentView: View {
         if #available(iOS 26.0, *) { return true }
         return false
     }
-    @State private var devSheet: SettingsSheet?
+    private enum DeveloperSheet: Identifiable {
+        case settings(SettingsSheet), launch(UUID)
+        var id: String {
+            switch self {
+            case .settings(let sheet): return "settings-\(sheet.rawValue)"
+            case .launch(let id): return "steam-launch-\(id)"
+            }
+        }
+    }
+    @State private var devPresentation = SteamLaunchSheetPresentation<DeveloperSheet>()
+    @ObservedObject private var launchPicker = SteamLaunchPickerModel.shared
+    @State private var dockStarting = false
     @StateObject private var logStore = LogStore.shared
     @StateObject private var jitCoordinator = JITCoordinator.shared
     @State private var jitStatus: JITStatus = .unknown
@@ -1291,12 +1302,45 @@ struct ContentView: View {
                 if wine_process_is_running() == 0 { MadeiraDock.cleanup() }
             }
             .onReceive(NotificationCenter.default.publisher(for: SteamSignIn.didChange)) { _ in
+                if let id = launchPicker.request?.id { launchPicker.cancel(id) }
                 if !SteamSignIn.isSignedIn { MadeiraDock.cleanup() }
             }
             // A Home Screen shortcut (madeira://play?exe=...) starts its library entry,
             // now or, from a cold start, once the library is up.
             .onReceive(ShortcutRouter.shared.$pendingExe) { _ in launchPendingShortcut() }
             .onChange(of: library.enabled) { _, _ in launchPendingShortcut() }
+        }
+        .sheet(item: Binding(get: { devPresentation.active }, set: { sheet in
+            if sheet == nil {
+                if case .launch(let id) = devPresentation.active { launchPicker.cancel(id) }
+                devPresentation.dismiss()
+            }
+        }), onDismiss: {
+            let dismissed = devPresentation.dismissing
+            let next = devPresentation.didDismiss()
+            if case .launch(let id) = dismissed { launchPicker.cancel(id) }
+            if let next {
+                if case .launch(let id) = next, launchPicker.request?.id != id { return }
+                _ = devPresentation.present(next)
+            }
+        }) { sheet in
+            switch sheet {
+            case .settings(let settings):
+                switch settings {
+                case .steamSignIn: SteamSignInView()
+                case .dock: MadeiraDockView { startDock($0, compactPool: $1) }
+                case .allSettings: AllSettingsView()
+                }
+            case .launch(let id):
+                if let request = launchPicker.request, request.id == id { SteamLaunchPicker(request: request) }
+            }
+        }
+        .onChange(of: launchPicker.request?.id) { _, id in
+            guard !library.enabled else { return }
+            if let id {
+                if devPresentation.busy { devPresentation.dismiss(next: .launch(id)) }
+                else { _ = devPresentation.present(.launch(id)) }
+            } else if case .launch = devPresentation.active { devPresentation.dismiss() }
         }
     }
 
@@ -1571,14 +1615,14 @@ struct ContentView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 12) {
                 if SteamSignIn.isEnabled {
-                    Button("Steam sign-in") { devSheet = .steamSignIn }
+                    Button("Steam sign-in") { _ = devPresentation.present(.settings(.steamSignIn)) }
                         .buttonStyle(.bordered)
                 }
                 if MadeiraDock.enabled {
-                    Button("Madeira Dock") { devSheet = .dock }
+                    Button("Madeira Dock") { _ = devPresentation.present(.settings(.dock)) }
                         .buttonStyle(.bordered)
                 }
-                Button("All settings") { devSheet = .allSettings }
+                Button("All settings") { _ = devPresentation.present(.settings(.allSettings)) }
                     .buttonStyle(.bordered)
                 Button("Enable JIT") {
                     enableJIT()
@@ -2050,15 +2094,7 @@ struct ContentView: View {
         } message: {
             Text("Close Madeira from the app switcher and open it again to use the new interface.")
         }
-        // One sheet for the strip, not one per button: a sheet attached to a
-        // button closed again whenever this often-redrawn screen rebuilt it.
-        .sheet(item: $devSheet) { sheet in
-            switch sheet {
-            case .steamSignIn: SteamSignInView()
-            case .dock: MadeiraDockView { startDock($0, compactPool: $1) }
-            case .allSettings: AllSettingsView()
-            }
-        }
+
     }
 
     private func runTriangleTest() {
@@ -2410,6 +2446,7 @@ struct ContentView: View {
     /// applies the entry's launch profile and runs the same full sequence as the
     /// developer interface's buttons.
     private func launchLibraryEntry(_ entry: LibraryEntry) {
+        guard !dockStarting else { return }
         // A Steam game starts through Madeira Dock with its own launch profile (SteamGames.swift),
         // unless its Game details page chose "The game": then its own program starts below, like
         // any library game (SteamDirectStart).
@@ -2446,6 +2483,8 @@ struct ContentView: View {
 
     /// The rest of Play, with JIT on: checks the entry's launch profile and starts it.
     private func startLibraryEntry(_ entry: LibraryEntry) {
+        guard !dockStarting, library.current == nil, wine_process_is_running() == 0,
+              wineserver_is_running() == 0 else { return }
         do { if entry.desktop != true { _ = try LibraryModel.executable(entry.launchRelativePath) }; try entry.validate() }
         catch {
             library.error = error.localizedDescription
@@ -2471,7 +2510,9 @@ struct ContentView: View {
     /// Debugger stays attached during PE loading so mprotect_exec can use BRK
     /// to prepare code pages. Detach happens after Wine finishes + recovery.
     /// `profile` is a library entry whose launch profile applies to this run.
-    private func runWineFullSequence(profile: LibraryEntry? = nil) {
+    private func runWineFullSequence(profile: LibraryEntry? = nil, dockLaunch: Bool = false) {
+        guard !dockStarting || dockLaunch else { return }
+        if let id = launchPicker.request?.id { launchPicker.cancel(id) }
         guard jit_check_debugged() else {
             logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
             if profile != nil { LibraryModel.shared.launchFailed() }
@@ -3142,21 +3183,53 @@ struct ContentView: View {
     /// show in the library, and the session gets the full-screen game view.
     /// `profile` is a Steam game's library entry (its Game details page): the
     /// session then takes that entry's display, performance and on-screen settings.
-    private func startDock(_ game: DockGame, compactPool: Bool, profile: LibraryEntry? = nil) {
+    private func dockLaunchBlocker(_ game: DockGame, profile: LibraryEntry?, allowPreparing: Bool = false) -> String? {
+        guard !dockStarting || allowPreparing else { return "A Steam launch is already being prepared." }
+        guard StikJITHelper.ready else { return "Enable JIT before playing." }
+        guard wine_process_is_running() == 0, wineserver_is_running() == 0,
+              !library.enabled || library.current == nil else { return "A session is already running." }
+        if library.enabled, LibraryModel.sessionsThisRun > 0, MadeiraConfig.flag("MADEIRA_ONE_SESSION_PER_RUN") {
+            return LibraryModel.restartMessage
+        }
+        do {
+            try MadeiraDock.validate(game, drive: MadeiraDock.drive)
+            try profile?.validate()
+            guard SteamSignIn.isSignedIn else { return "Sign in to Steam in Madeira before starting Dock." }
+        } catch { return error.localizedDescription }
+        return nil
+    }
+
+    private func startDock(_ game: DockGame, compactPool: Bool, profile: LibraryEntry? = nil,
+                           launchOption: UInt32? = nil) {
+        guard !dockStarting else { return }
+        let game = launchOption == nil ? (MadeiraDock.currentGame(game, drive: MadeiraDock.drive) ?? game) : game
         let inLibrary = library.enabled
-        guard jitReadyForLaunch(inLibrary: inLibrary, entry: profile?.id,
-                                then: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }
-        guard cloudClear(game.id, name: game.name, retry: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }
-        guard wine_process_is_running() == 0, wineserver_is_running() == 0, !inLibrary || library.current == nil else {
-            logStore.log("[madeira-dock] a session already ran in this app run; restart Madeira first", level: .error)
-            if inLibrary { library.error = "A session is already running." }
+        if launchOption == nil {
+            guard jitReadyForLaunch(inLibrary: inLibrary, entry: profile?.id,
+                                    then: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }
+            guard cloudClear(game.id, name: game.name,
+                             retry: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }
+        }
+        if let blocker = dockLaunchBlocker(game, profile: profile) {
+            MadeiraDockModel.shared.status = blocker
+            logStore.log("[madeira-dock] not started: \(blocker)", level: .error)
+            if inLibrary {
+                if blocker == LibraryModel.restartMessage { library.restartNotice = blocker }
+                else { library.error = blocker }
+            }
             return
         }
-        if inLibrary, LibraryModel.sessionsThisRun > 0, MadeiraConfig.flag("MADEIRA_ONE_SESSION_PER_RUN") {
-            LogStore.shared.log("[session-once] Dock launch held: \(LibraryModel.sessionsThisRun) session(s) already ran in this app run")
-            library.restartNotice = LibraryModel.restartMessage
+        // Refresh metadata and pick an option while the native Steam connection is open.
+        // Only the picker's explicit Play callback can proceed to authentication handoff.
+        guard let launchOption else {
+            library.error = nil
+            launchPicker.begin(game, readiness: { dockLaunchBlocker(game, profile: profile) }) { selected in
+                startDock(game, compactPool: compactPool, profile: profile, launchOption: selected)
+            }
             return
         }
+        guard let selectedSignIn = SteamSignIn.credentialsForDock() else { return }
+        dockStarting = true
         func fail(_ error: Error) {
             MadeiraDock.cleanup()
             SteamOwnedLibrary.shared.dockEnded()
@@ -3164,29 +3237,28 @@ struct ContentView: View {
             logStore.log("[madeira-dock] not started: \(error.localizedDescription)", level: .error)
             if inLibrary { library.error = error.localizedDescription }
         }
-        do {
-            try MadeiraDock.validate(game, drive: MadeiraDock.drive)
-            try profile?.validate()
-            guard SteamSignIn.isSignedIn else { throw DockError.message("Sign in to Steam in Madeira before starting Dock.") }
-        } catch { fail(error); return }
         // Only one sign-in of the account may be online: the app's own Steam connection
         // (library, playtime, downloads) logs off and its socket closes before the sign-in
         // is handed to Valve's client, and it stays off until the Dock session has ended
         // (SteamOwnedLibrary.prepareDock / dockEnded, SteamConnectionGate).
         Task { @MainActor in
+            defer { dockStarting = false }
             await SteamOwnedLibrary.shared.prepareDock()
             do {
                 // The launch state may have changed while the connection closed.
-                guard StikJITHelper.ready, wine_process_is_running() == 0, wineserver_is_running() == 0,
-                      !inLibrary || library.current == nil else {
-                    throw DockError.message("The launch state changed. Enable JIT and try again.")
+                if let blocker = dockLaunchBlocker(game, profile: profile, allowPreparing: true) {
+                    throw DockError.message(blocker)
                 }
                 guard let signIn = SteamSignIn.credentialsForDock() else {
                     throw DockError.message("Sign in to Steam in Madeira before starting Dock.")
                 }
+                guard signIn.accountName == selectedSignIn.accountName,
+                      signIn.refreshToken == selectedSignIn.refreshToken else {
+                    throw DockError.message("Your Steam sign-in changed. Choose a launch option again.")
+                }
                 try MadeiraDock.writeHandoff(account: signIn.accountName, token: signIn.refreshToken, appID: game.id)
             } catch { fail(error); return }
-            MadeiraDock.configure(game)
+            MadeiraDock.configure(game, launchOption: launchOption)
             // The game's one-time installs (its Steam install script) run first, in the same
             // session. No session runs yet, so the registry files can be read and written.
             DockInstallers.prepare(game, drive: MadeiraDock.drive, prefix: MadeiraDock.prefix)
@@ -3233,7 +3305,7 @@ struct ContentView: View {
                 if let profile { library.begin(profile, dock: game) }
                 else { library.begin(.dockSession(title: game.name, width: width, height: height), remember: false, dock: game) }
             }
-            runWineFullSequence(profile: profile)
+            runWineFullSequence(profile: profile, dockLaunch: true)
         }
     }
 

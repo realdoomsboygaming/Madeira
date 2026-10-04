@@ -1135,11 +1135,16 @@ static void *wine_process_thread(void *arg) {
                 enum { per_launch_count = sizeof(per_launch) / sizeof(per_launch[0]) };
                 BOOL game_set[per_launch_count];
                 for (size_t i = 0; i < per_launch_count; i++) game_set[i] = getenv(per_launch[i]) != NULL;
+                /* The explicit picker choice belongs to the native Dock
+                 * handoff; generic configuration must not replace its ID. */
+                BOOL dock_selected = getenv("MADEIRA_DOCK_AUTH_FILE") != NULL &&
+                                     getenv("MADEIRA_STEAM_HOST_LAUNCH_OPTION") != NULL;
                 for (NSString *raw in [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
                     NSString *line = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
                     NSRange eq = [line rangeOfString:@"="];
                     if (!line.length || [line hasPrefix:@"#"] || eq.location == NSNotFound || eq.location == 0) continue;
                     NSString *k = [line substringToIndex:eq.location], *v = [line substringFromIndex:eq.location + 1];
+                    if (dock_selected && [k caseInsensitiveCompare:@"MADEIRA_STEAM_HOST_LAUNCH_OPTION"] == NSOrderedSame) continue;
                     BOOL kept = NO;
                     for (size_t i = 0; i < per_launch_count; i++)
                         if (game_set[i] && !strcmp(k.UTF8String, per_launch[i])) kept = YES;
@@ -1166,6 +1171,7 @@ static void *wine_process_thread(void *arg) {
                     NSString *k = [[line substringWithRange:NSMakeRange(4, eq.location - 4)] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
                     NSString *v = [[line substringFromIndex:eq.location + 1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
                     if (!k.length) continue;
+                    if (dock_selected && [k caseInsensitiveCompare:@"MADEIRA_STEAM_HOST_LAUNCH_OPTION"] == NSOrderedSame) continue;
                     setenv(k.UTF8String, v.UTF8String, 1);
                     LOG("game config env: %{public}s=%{public}s", k.UTF8String, v.UTF8String);
                     fprintf(stderr, "[madeira-env] game %s=%s\n", k.UTF8String, v.UTF8String);

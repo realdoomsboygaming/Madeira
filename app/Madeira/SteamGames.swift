@@ -231,30 +231,33 @@ enum SteamDirectStart {
               !text.unicodeScalars.contains(where: { $0.value < 0x20 || "<>:\"|?*".unicodeScalars.contains($0) }) else { return nil }
         var parts: [Substring] = []
         for part in text.split(separator: "/") where part != "." {
-            if part == ".." { return nil }
+            if part == ".." || part.hasSuffix(".") || part.hasSuffix(" ") { return nil }
             parts.append(part)
         }
         return parts.joined(separator: "/")
     }
 
-    /// `relative` found under `root` one name at a time, exactly or else without case
-    /// (as Windows finds it): its spelling on disk, or nil when a name is missing, the
-    /// last one is not of the kind asked for, or the result leaves `root`.
+    /// `relative` found under `root` one name at a time without case (as
+    /// Windows finds it). Ambiguous names and symlinks leaving the installation
+    /// are rejected before following another component.
     static func onDisk(_ relative: String, in root: URL, directory: Bool) -> String? {
+        guard let relative = relativePath(relative) else { return nil }
         let fm = FileManager.default
         var url = root
+        let base = root.resolvingSymlinksInPath().standardizedFileURL.path
         var spelled: [String] = []
         for part in relative.split(separator: "/").map(String.init) {
-            guard let names = try? fm.contentsOfDirectory(atPath: url.path),
-                  let name = names.first(where: { $0 == part }) ?? names.first(where: { $0.caseInsensitiveCompare(part) == .orderedSame })
-            else { return nil }
+            guard let names = try? fm.contentsOfDirectory(atPath: url.path) else { return nil }
+            let matches = names.filter { $0.caseInsensitiveCompare(part) == .orderedSame }
+            guard matches.count == 1, let name = matches.first else { return nil }
             url.appendPathComponent(name)
+            let target = url.resolvingSymlinksInPath().standardizedFileURL.path
+            guard target == base || target.hasPrefix(base + "/") else { return nil }
             spelled.append(name)
         }
         var isDirectory: ObjCBool = false
         guard fm.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue == directory else { return nil }
-        let base = root.resolvingSymlinksInPath().path
-        let target = url.resolvingSymlinksInPath().path
+        let target = url.resolvingSymlinksInPath().standardizedFileURL.path
         guard target == base ? directory : target.hasPrefix(base + "/") else { return nil }
         return spelled.joined(separator: "/")
     }

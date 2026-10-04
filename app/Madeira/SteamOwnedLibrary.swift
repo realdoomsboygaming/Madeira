@@ -213,6 +213,9 @@ final class SteamOwnedLibrary: ObservableObject {
     private lazy var gate = SteamConnectionGate(close: { [session] in await session.suspend() },
                                                 reopen: { [session] in session.resume() })
     private lazy var fetcher = SteamLibraryFetcher(session: session)
+    /// A newer fetch for an app invalidates an older completion. Sign-in
+    /// changes also invalidate pending results before they can update caches.
+    private var launchMetadataRequests: [Int: UUID] = [:]
     private lazy var downloader = DepotDownloader(session: session)
     private var started = false
     /// Which account the cached list belongs to: a SHA-256 of the account name,
@@ -265,6 +268,7 @@ final class SteamOwnedLibrary: ObservableObject {
 
     /// Sign-in was stored or removed (SteamSignIn.didChange).
     private func signInChanged() {
+        launchMetadataRequests.removeAll()
         let now = SteamSignIn.isSignedIn
         guard now != signedIn || (now && Self.accountKey(SteamSignIn.accountName) != cachedAccount) else { return }
         signedIn = now
@@ -330,22 +334,37 @@ final class SteamOwnedLibrary: ObservableObject {
             .write(to: Self.cacheURL, options: .atomic)
     }
 
-    /// Steam's launch configuration for an owned app, for "Start with: The game"
-    /// (SteamDirectStart): from the cached library, else asked of Steam once over the
-    /// app's own connection (signed in, no session running) and kept in the cache.
-    /// nil when it cannot be had; the Program picker then decides.
-    func launchOptions(appID: Int) async -> [SteamLaunchOption]? {
-        if let cached = game(appID)?.launches { return cached }
-        guard Self.enabled, signedIn, !inSession, appID > 0, appID <= Int(UInt32.max) else { return nil }
+    /// Direct starts can use cached metadata; Dock refreshes `config.launch`
+    /// through the same Steam connection every time its picker opens.
+    /// A failed refresh never substitutes an older list.
+    func launchOptions(appID: Int, refresh: Bool = false) async -> [SteamLaunchOption]? {
+        if !refresh, let cached = game(appID)?.launches { return cached }
+        guard refresh || Self.enabled, SteamSignIn.isSignedIn,
+              !inSession, !sessionRunning, gate.open, !Task.isCancelled,
+              appID > 0, appID <= Int(UInt32.max),
+              let account = Self.accountKey(SteamSignIn.accountName) else { return nil }
+        let request = UUID()
+        launchMetadataRequests[appID] = request
+        defer {
+            if launchMetadataRequests[appID] == request { launchMetadataRequests.removeValue(forKey: appID) }
+        }
+        func current() -> Bool {
+            !Task.isCancelled && launchMetadataRequests[appID] == request &&
+                !inSession && !sessionRunning && gate.open && SteamSignIn.isSignedIn &&
+                Self.accountKey(SteamSignIn.accountName) == account
+        }
         do {
-            guard let info = try await fetcher.fetchAppInfo(appID: UInt32(appID)) else { return nil }
-            if let index = owned.firstIndex(where: { $0.id == appID }) {
+            guard let info = try await fetcher.fetchAppInfo(appID: UInt32(appID)),
+                  info.appID == UInt32(appID) else { return nil }
+            guard current() else { return nil }
+            if cachedAccount == account, let index = owned.firstIndex(where: { $0.id == appID }) {
                 owned[index].launches = info.launches
                 writeCache()
             }
             SteamLog.event("[steam-start] launch configuration app=\(appID) entries=\(info.launches.count)")
             return info.launches
         } catch {
+            guard current() else { return nil }
             handleSessionError(error, context: "start", report: false)
             return nil
         }

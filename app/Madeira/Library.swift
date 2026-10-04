@@ -234,7 +234,7 @@ struct LibraryEntry: Codable, Identifiable {
     /// nil = the application's own choice.
     var anisotropyLimit: Int?
     /// A Steam game (SteamGames.swift): Madeira Dock starts it by this App ID
-    /// through Valve's client, with Steam's default launch option.
+    /// through Valve's client, with the Steam launch option selected at Play.
     /// `relativePath` is then its install folder, relative to drive_c.
     var steamAppID: Int?
     /// How a Steam game starts (Game details › Steam › Start with): nil is Madeira
@@ -2082,8 +2082,48 @@ struct LibraryCells<Item: Identifiable, Cell: View>: View {
     }
 }
 
+/// A sheet handoff waits for UIKit's dismissal callback before presenting the next
+/// sheet. Its revision also makes delayed callbacks from an old details page inert.
+struct SteamLaunchSheetPresentation<Sheet: Identifiable> {
+    private(set) var active: Sheet?
+    private(set) var dismissing: Sheet?
+    private var pending: Sheet?
+    private(set) var revision = 0
+    var busy: Bool { active != nil || dismissing != nil }
+
+    @discardableResult mutating func present(_ sheet: Sheet) -> Bool {
+        guard !busy else { return false }
+        active = sheet; revision += 1
+        return true
+    }
+    mutating func dismiss(next: Sheet? = nil) {
+        if let active {
+            self.active = nil; dismissing = active; pending = next; revision += 1
+        } else if let next { pending = next }
+    }
+    mutating func didDismiss() -> Sheet? {
+        guard dismissing != nil else { return nil }
+        let next = pending
+        active = nil; dismissing = nil; pending = nil; revision += 1
+        return next
+    }
+}
+
+private enum SteamLibrarySheet: Identifiable {
+    case browser, details(LibraryEntry), settings(SettingsSheet), launch(UUID)
+    var id: String {
+        switch self {
+        case .browser: return "browser"
+        case .details(let entry): return "details-\(entry.id)"
+        case .settings(let sheet): return "settings-\(sheet.rawValue)"
+        case .launch(let id): return "steam-launch-\(id)"
+        }
+    }
+}
+
 struct LibraryView: View {
     @ObservedObject private var model = LibraryModel.shared
+    @ObservedObject private var launchPicker = SteamLaunchPickerModel.shared
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var liquidMetal = LiquidMetalSetting.shared
@@ -2099,8 +2139,7 @@ struct LibraryView: View {
     private var jitProblem: JITCoordinator.ConnectionProblem? {
         jit.connectionProblem.flatMap { model.error == $0.message ? $0 : nil }
     }
-    @State private var browser = false
-    @State private var selected: LibraryEntry?
+    @State private var presentation = SteamLaunchSheetPresentation<SteamLibrarySheet>()
     @State private var search = ""
     /// The Settings tab's own search text, kept apart from the library's.
     @State private var settingsSearch = ""
@@ -2111,7 +2150,6 @@ struct LibraryView: View {
     // The interface the next start uses (FrontendChoice).
     @State private var developerUI = !FrontendChoice.preferNew
     @State private var restartNotice = false
-    @State private var settingsSheet: SettingsSheet?
     @State private var settingsRefresh = 0
     @AppStorage("madeiraLibraryLayout") private var layout = "cards"
     @AppStorage("madeiraLibrarySort") private var sort = "played"
@@ -2130,7 +2168,7 @@ struct LibraryView: View {
             return $0.title.localizedStandardCompare($1.title) == .orderedAscending
         }
     }
-    var body: some View {
+    private var tabs: some View {
         // The system tab bar: on iOS 26 it is the floating Liquid Glass bar whose
         // glass selection slides between the tabs and follows a drag. Icons only; the
         // names stay for VoiceOver.
@@ -2159,15 +2197,46 @@ struct LibraryView: View {
             LibraryLargeTitle()
             if tab == 0 { libraryToolbar } else { settingsToolbar }
         }
+    }
+    private var presentedTabs: some View {
+        tabs
+        // One stable sheet owner for both tabs, including the Steam launch picker.
+        .sheet(item: Binding(get: { presentation.active }, set: { sheet in
+            if sheet == nil {
+                if case .launch(let id) = presentation.active { launchPicker.cancel(id) }
+                presentation.dismiss()
+            }
+        }), onDismiss: sheetDismissed) { sheet in sheetContent(sheet) }
+        .onChange(of: launchPicker.request?.id) { _, id in
+            if let id {
+                if presentation.busy { presentation.dismiss(next: .launch(id)) }
+                else { presentSheet(.launch(id)) }
+            } else if case .launch = presentation.active { presentation.dismiss() }
+        }
+    }
+    private var sessionAwareTabs: some View {
+        presentedTabs
+        .onChange(of: model.current) { _, current in if current != nil { dismissSheets() } }
+        .onChange(of: model.error) { _, error in if error != nil { dismissSheets() } }
+        .onChange(of: model.restartNotice) { _, notice in if notice != nil { dismissSheets() } }
+        .onChange(of: model.jitNotice) { _, notice in if notice != nil { dismissSheets() } }
+        .onChange(of: model.cloudNotice) { _, notice in if notice != nil { dismissSheets() } }
+        .onChange(of: jit.showSetup) { _, show in if show { dismissSheets() } }
+    }
+    private var tabsWithAlerts: some View {
+        sessionAwareTabs
         // On the tab view, not inside one tab's page: an alert attached to the Library
         // page cannot present while Settings is showing, so an error raised there (its
         // Enable JIT, for one) waited until the Library tab came back.
         .alert(jitProblem == nil ? "Library" : "Couldn't Enable JIT",
-               isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
+               isPresented: Binding(get: { model.error != nil && !presentation.busy }, set: { if !$0 { model.error = nil } })) {
             if let jitProblem { jitConnectionActions(jitProblem, retry: enableJIT) { model.error = nil } }
             Button("OK", role: .cancel) { model.error = nil }
         } message: { Text(model.error ?? "") }
         .fullScreenCover(isPresented: $onboarding.presented) { OnboardingView() }
+    }
+    var body: some View {
+        tabsWithAlerts
         .onAppear {
             // An ended desktop session's surface never stays over the library.
             EndedSessionSurface.install(); EndedSessionSurface.hide(reason: "library-appeared")
@@ -2184,7 +2253,56 @@ struct LibraryView: View {
         .onAppear { GlassSkin.shared.start() }
         .onDisappear { GlassSkin.shared.stop() }
         .onReceive(controller.commands) { command in
-            if selected == nil, !browser, !onboarding.presented, command == "tab" { switchTab(to: 1 - tab) }
+            if !presentation.busy, !onboarding.presented, command == "tab" { switchTab(to: 1 - tab) }
+        }
+    }
+    private func presentSheet(_ sheet: SteamLibrarySheet) {
+        guard !onboarding.presented, model.current == nil else {
+            if case .launch(let id) = sheet { launchPicker.cancel(id) }
+            return
+        }
+        _ = presentation.present(sheet)
+    }
+    private func dismissSheets() {
+        if let id = launchPicker.request?.id { launchPicker.cancel(id) }
+        presentation.dismiss()
+    }
+    private func sheetDismissed() {
+        let dismissed = presentation.dismissing
+        let next = presentation.didDismiss()
+        if case .launch(let id) = dismissed { launchPicker.cancel(id) }
+        settingsRefresh += 1
+        guard let next else { return }
+        guard model.error == nil, model.restartNotice == nil, model.jitNotice == nil,
+              model.cloudNotice == nil, !jit.showSetup else {
+            if case .launch(let id) = next { launchPicker.cancel(id) }
+            return
+        }
+        if case .launch(let id) = next, launchPicker.request?.id != id { return }
+        presentSheet(next)
+    }
+    @ViewBuilder private func sheetContent(_ sheet: SteamLibrarySheet) -> some View {
+        switch sheet {
+        case .browser:
+            NavigationStack { ExecutableBrowser(folder: LibraryModel.drive) { entry in
+                model.save(entry); presentation.dismiss(next: .details(entry))
+            } }
+        case .details(let entry):
+            LibraryDetail(entry: entry, play: { profile in
+                let revision = presentation.revision
+                play(profile)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
+                    if presentation.revision == revision, model.startingJIT != entry.id { presentation.dismiss() }
+                }
+            })
+        case .settings(let sheet):
+            switch sheet {
+            case .allSettings: AllSettingsView()
+            case .steamSignIn: SteamSignInView()
+            case .dock: MadeiraDockView(start: startDock)
+            }
+        case .launch(let id):
+            if let request = launchPicker.request, request.id == id { SteamLaunchPicker(request: request) }
         }
     }
     @ToolbarContentBuilder private var libraryToolbar: some ToolbarContent {
@@ -2204,7 +2322,7 @@ struct LibraryView: View {
                 }
             } label: { Label("Library options", systemImage: "line.3.horizontal.decrease") }
         }
-        ToolbarItem(placement: .topBarTrailing) { Button { browser = true } label: { Label("Add executable", systemImage: "plus") } }
+        ToolbarItem(placement: .topBarTrailing) { Button { presentSheet(.browser) } label: { Label("Add executable", systemImage: "plus") } }
     }
     @ToolbarContentBuilder private var settingsToolbar: some ToolbarContent {
         ToolbarItem(placement: .topBarTrailing) {
@@ -2247,11 +2365,11 @@ struct LibraryView: View {
             if MadeiraConfig.flag("MADEIRA_RUNTIME_SETTINGS") {
                 if settingsShow("display", "refresh", "rate", "ProMotion", "120 Hz") { DisplayRateSettings() }
                 if settingsShow("memory", "JIT pool", "pool", "video memory", "VRAM", "swap", "coverage", "madsync", "sync", "eco", "all settings") {
-                    RuntimeMemorySyncSettings(open: { settingsSheet = $0 }, refresh: settingsRefresh)
+                    RuntimeMemorySyncSettings(open: { presentSheet(.settings($0)) }, refresh: settingsRefresh)
                 }
             }
             if SteamSettingsSection.shown, settingsShow("Steam", "Dock", "sign in", "account", "setup") {
-                SteamSettingsSection(open: { settingsSheet = $0 })
+                SteamSettingsSection(open: { presentSheet(.settings($0)) })
             }
             if settingsShow("saves", "backup", "restore", "save games") { SavesSection() }
             if settingsShow("appearance", "liquid metal", "metal", "glass") {
@@ -2294,16 +2412,7 @@ struct LibraryView: View {
         } message: {
             Text("Close Madeira from the app switcher and open it again to switch interfaces.")
         }
-        // The Settings sheets hang off the Form, never off one of its rows: a Form
-        // may rebuild its rows while a sheet slides up over it, and a sheet whose
-        // owning row is rebuilt closes again at once.
-        .sheet(item: $settingsSheet, onDismiss: { settingsRefresh += 1 }) { sheet in
-            switch sheet {
-            case .allSettings: AllSettingsView()
-            case .steamSignIn: SteamSignInView()
-            case .dock: MadeiraDockView(start: startDock)
-            }
-        }
+
     }
     private var library: some View {
         GeometryReader { viewport in
@@ -2311,7 +2420,7 @@ struct LibraryView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 HStack {
-                    Button { selected = model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry } label: {
+                    Button { presentSheet(.details(model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry)) } label: {
                         if liquidMetal.on {
                             // On the chrome's middle band (dark, or light in light mode), with a soft
                             // halo of the other tone for the moments a highlight passes under it.
@@ -2346,7 +2455,7 @@ struct LibraryView: View {
                 let steamFirst = MadeiraDock.enabled && SteamGamesSection.hasInstalled
                 if steamFirst {
                     SteamGamesSection(search: search, layout: layout, sort: sort, width: viewport.size.width,
-                                      part: .installed, open: { selected = $0 })
+                                      part: .installed, open: { presentSheet(.details($0)) })
                 }
                 if SteamGamesSection.shown {
                     VStack(alignment: .leading, spacing: 14) {
@@ -2366,7 +2475,7 @@ struct LibraryView: View {
                     }
                     if MadeiraDock.enabled {
                         SteamGamesSection(search: search, layout: layout, sort: sort, width: viewport.size.width,
-                                          part: steamFirst ? .notInstalled : .all, open: { selected = $0 })
+                                          part: steamFirst ? .notInstalled : .all, open: { presentSheet(.details($0)) })
                     }
                 } else if model.entries.filter({ $0.desktop != true && $0.steamAppID == nil }).isEmpty {
                     ContentUnavailableView("Make yourself at home", systemImage: "gamecontroller", description: Text("Copy a game's folder into Madeira › wine › drive_c with the Files app, then tap + and choose its .exe."))
@@ -2380,48 +2489,24 @@ struct LibraryView: View {
         }
         .refreshable { await SteamGamesSection.refresh() }
         .onReceive(controller.commands) { command in
-            guard tab == 0, selected == nil, !browser, !onboarding.presented else { return }
+            guard tab == 0, !presentation.busy, !onboarding.presented else { return }
             let items = entries
             let ids = [LibraryEntry.desktopID] + items.map(\.id)
             let index = ids.firstIndex(where: { $0 == focused }) ?? 0
-            if command == "add" { browser = true }
+            if command == "add" { presentSheet(.browser) }
             else if command == "accept" {
-                if index == 0 { selected = model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry }
-                else { selected = items[index - 1] }
+                if index == 0 { presentSheet(.details(model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry)) }
+                else { presentSheet(.details(items[index - 1])) }
             }
             else if ["left", "right", "up", "down"].contains(command) {
                 let delta = command == "left" || command == "up" ? -1 : 1
                 withAnimation(UIAccessibility.isReduceMotionEnabled ? nil : .easeOut(duration: 0.18)) { focused = ids[(index + delta + ids.count) % ids.count] }
             }
         }
-        .sheet(isPresented: $browser) {
-            NavigationStack { ExecutableBrowser(folder: LibraryModel.drive) { entry in
-                model.save(entry); browser = false; selected = entry
-            } }
-        }
-        .sheet(item: $selected) { entry in
-            // The details page stays up until the session's starting screen takes
-            // over (or an error needs the library's alert), instead of showing the
-            // library for the moment a start spends preparing.
-            LibraryDetail(entry: entry, play: { profile in
-                play(profile)
-                // Not while Play is still enabling JIT: the session's start, an error, or
-                // JIT setup closes the page then.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
-                    if selected?.id == entry.id, model.startingJIT != entry.id { selected = nil }
-                }
-            })
-        }
-        .onChange(of: model.current) { _, current in if current != nil { selected = nil } }
-        .onChange(of: model.error) { _, error in if error != nil { selected = nil } }
-        .onChange(of: model.restartNotice) { _, notice in if notice != nil { selected = nil } }
-        .onChange(of: model.jitNotice) { _, notice in if notice != nil { selected = nil } }
-        .onChange(of: model.cloudNotice) { _, notice in if notice != nil { selected = nil } }
-        .onChange(of: jit.showSetup) { _, show in if show { selected = nil } }
         .onChange(of: model.showDetail) { _, id in
             guard let id else { return }
             model.showDetail = nil
-            selected = model.entries.first { $0.id == id }
+            if let entry = model.entries.first(where: { $0.id == id }) { presentSheet(.details(entry)) }
         }
         .onChange(of: scenePhase) { _, phase in if phase == .active { model.refreshFlag() } }
         .onAppear {
@@ -2440,7 +2525,7 @@ struct LibraryView: View {
         }
     }
     private func libraryItem(_ entry: LibraryEntry, list: Bool, dense: Bool = false) -> some View {
-        Button { selected = entry } label: {
+        Button { presentSheet(.details(entry)) } label: {
             Group {
                 if list && dense {
                     // One short row per game.
@@ -2791,7 +2876,7 @@ struct LibraryDetail: View {
                     } header: { Text("Executable") } footer: {
                         Text(entry.startsSteamGameDirectly
                              ? "The game starts this program directly, without Steam."
-                             : "Valve's client starts the game's default Steam launch option from this folder.")
+                             : "Choose a Steam launch option when you press Play. Valve's client starts it from this installation.")
                     }
                 } else if entry.desktop != true {
                     Section("Executable") { Text(entry.windowsPath).font(.caption.monospaced()).textSelection(.enabled) }

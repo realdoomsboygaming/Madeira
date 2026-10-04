@@ -379,7 +379,11 @@ struct SteamAppInfo {
 /// entry's type and the platform, architecture and beta branch it is for.
 /// Untrusted text: bounded here, and validated as a path by SteamDirectStart.
 struct SteamLaunchOption: Codable, Hashable, Sendable {
+    /// Steam's numeric `config.launch` key. Older library caches have no key;
+    /// a refreshed list is required before choosing a Dock configuration.
+    var optionID: UInt32? = nil
     var executable: String
+    var description: String? = nil
     var arguments = ""
     var workingDir = ""
     /// "default", "none", "option1", "server", "editor", "vr", ... ("" when absent).
@@ -388,12 +392,16 @@ struct SteamLaunchOption: Codable, Hashable, Sendable {
     var osarch = ""
     var betaKey = ""
 
-    /// Entries in Steam's order (numeric keys), without those that name no
-    /// program or carry oversized text; at most 32.
+    /// Entries in Steam's numeric order, retaining each original key rather
+    /// than its position. Invalid keys and oversized launch text are omitted.
     static func parse(_ launch: [String: Any]) -> [SteamLaunchOption] {
-        let keys = launch.keys.compactMap { key in Int(key).map { ($0, key) } }.sorted { $0.0 < $1.0 }
+        let keys = launch.keys.compactMap { key -> (UInt32, String)? in
+            guard !key.isEmpty, key.utf8.allSatisfy({ (48...57).contains($0) }),
+                  let id = UInt32(key), String(id) == key else { return nil }
+            return (id, key)
+        }.sorted { $0.0 < $1.0 }
         var options: [SteamLaunchOption] = []
-        for (_, key) in keys.prefix(32) {
+        for (optionID, key) in keys {
             guard let entry = launch[key] as? [String: Any], let executable = entry["executable"] as? String,
                   !executable.isEmpty, executable.utf8.count <= 512 else { continue }
             func text(_ value: Any?, limit: Int = 256) -> String? {
@@ -405,7 +413,17 @@ struct SteamLaunchOption: Codable, Hashable, Sendable {
             guard let arguments = text(entry["arguments"], limit: 2048), let workingDir = text(entry["workingdir"], limit: 512),
                   let type = text(entry["type"]), let oslist = text(config["oslist"]), let osarch = text(config["osarch"]),
                   let betaKey = text(config["betakey"]) else { continue }
-            options.append(SteamLaunchOption(executable: executable, arguments: arguments, workingDir: workingDir,
+            func readableDescription(_ value: Any?) -> String? {
+                guard let string = text(value)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !string.isEmpty,
+                      string.range(of: "#[A-Za-z_][A-Za-z0-9_]*", options: .regularExpression) == nil,
+                      !string.unicodeScalars.contains(where: { $0.value < 32 }) else { return nil }
+                return string
+            }
+            let localized = entry["description_loc"] as? [String: Any]
+            let description = readableDescription(entry["description"]) ?? readableDescription(localized?["english"])
+            options.append(SteamLaunchOption(optionID: optionID, executable: executable, description: description,
+                                             arguments: arguments, workingDir: workingDir,
                                              type: type, oslist: oslist, osarch: osarch, betaKey: betaKey))
         }
         return options
